@@ -502,9 +502,11 @@ class StrataEngine:
         threading.Thread(target=self._pump, daemon=True).start()
 
     def _start_failed(self, log, tail: str, ram_try: float | None, restarts: int):
-        """Raise the error of a start that ended before READY and gets no restart (the log closed first)."""
+        """Raise the error of a start that ended before READY and gets no restart (the log closed first).  The restarts
+        are named only when this call made some: a remembered size (restart()) that fails for another reason is not
+        one."""
         why = ""
-        if ram_try is not None:
+        if restarts > 0:
             found = ram_oom_of(tail)
             why = (f" - {restarts} restart(s) with a smaller RAM tier, the last at STRATA_GLM_RAM_GB={ram_try:g}" +
                    (f" ran out of pinned RAM at {found[0]:.2f} GB" if found else ""))
