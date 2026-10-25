@@ -71,7 +71,8 @@ def wait_gpu_release(pid: int, timeout: float = 60.0):
     """An engine that has ended still holds its GPU memory for a few seconds - the driver frees tens of GB of VRAM and
     its pinned RAM tier after the process is gone - and an engine started at once finds the cards full (the split
     search measures them before anything loads: the context reload's new engine got 0.09 GB and failed).  Waits until
-    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD)."""
+    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD).  False: `timeout` passed and
+    the GPUs still list it (the caller goes on anyway, or - a RAM restart - gives up)."""
     try:
         from serve.telemetry import gpu_pids
     except ImportError:
@@ -81,13 +82,14 @@ def wait_gpu_release(pid: int, timeout: float = 60.0):
         pids = gpu_pids() if gpu_pids else None
         if pids is None:
             time.sleep(max(0.0, 5.0 - (time.time() - t0)))
-            return
+            return True
         if pid not in pids:
             if time.time() - t0 > 1:
                 print(f"[maya] the GPUs freed the engine's memory in {time.time() - t0:.0f} s", flush=True)
-            return
+            return True
         time.sleep(0.5)
-    print(f"[maya] the GPUs still list the old engine after {timeout:.0f} s; starting anyway", flush=True)
+    print(f"[maya] the GPUs still list the old engine after {timeout:.0f} s", flush=True)
+    return False
 
 
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
@@ -482,13 +484,13 @@ class StrataEngine:
                 break
             tail = self._log_since(log_start)
             nxt = ram_retry_gb(tail, env if env is not None else os.environ, ram_try, restarts)
-            if nxt is None:
+            # (no restart while the refused engine runs on after its kill, or the GPUs still hold its memory: the
+            # start's own error stands)
+            if nxt is None or not self._end_refused() or not wait_gpu_release(self.proc.pid):
                 self._start_failed(log, tail, ram_try, restarts)
-            self._end_refused()
             restarts += 1
             print(f"[maya] the engine ran out of pinned RAM at {ram_oom_of(tail)[0]:.2f} GB - restarting with "
                   f"STRATA_GLM_RAM_GB={nxt:g} ({restarts} of {RAM_RETRY_MAX})", flush=True)
-            wait_gpu_release(self.proc.pid)
             ram_try = nxt
         self.ram_auto_gb = ram_try
         # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
@@ -516,15 +518,20 @@ class StrataEngine:
 
     def _end_refused(self):
         """A start refused for want of pinned RAM: its process is ending (its output closed) - wait for it, or end it,
-        so no engine is left behind the restart."""
+        so no engine is left behind the restart.  False: it still runs after the kill (no restart then)."""
+        gone = True
         try:
             self.proc.wait(timeout=ENGINE_END_WAIT_S)
         except subprocess.TimeoutExpired:
-            self.proc.kill()
-            self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
+            except (OSError, subprocess.TimeoutExpired):
+                gone = False
         for pipe in (self.proc.stdin, self.proc.stdout):
             with contextlib.suppress(OSError):
                 pipe.close()
+        return gone
 
     def _log_since(self, offset: int, most: int = 256 << 10) -> str:
         """The engine log from `offset` (this start's), its last `most` bytes at most; empty without a log."""
