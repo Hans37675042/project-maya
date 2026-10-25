@@ -1281,22 +1281,16 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         // the start ends with the error of the part that failed first (the others stopped on it, or failed after it:
         // theirs follow) - a refused pin on the second card stopped the first one's warm-up, whose out of memory used
         // to stand for it
-        std::vector<int> failed = sl.failures();
-        for (int i = 0; i < n && failed.empty(); ++i)
-            if (!ok[(size_t) i]) failed.push_back(i);
-        if (!failed.empty()) {
-            err = errs[(size_t) failed[0]];
-            for (size_t k = 1; k < failed.size(); ++k) err += "; then " + errs[(size_t) failed[k]];
-            // short of pinned memory first: the line with every part's tier (planned or pinned) - the launcher's size
-            if (parts[(size_t) failed[0]]->tier_oom_) {
-                int64_t total = 0;
-                bool manual = false;
-                for (const Glm5Model* p : parts) {
-                    total += std::max<int64_t>(0, p->tier_try_b_);
-                    manual = manual || p->tier_manual_;
-                }
-                tier_oom_report(total, manual);
-            }
+        // (short of pinned memory first: the line with every part's tier, planned or pinned - the launcher's size)
+        std::vector<glmfast::SplitPartEnd> ends((size_t) n);
+        for (int i = 0; i < n; ++i) {
+            const Glm5Model* p = parts[(size_t) i];
+            ends[(size_t) i] = {ok[(size_t) i] != 0, errs[(size_t) i], p->tier_try_b_, p->tier_manual_, p->tier_oom_};
+        }
+        const glmfast::SplitStartEnd end = glmfast::split_start_end(sl.failures(), ends);
+        if (end.failed) {
+            err = end.err;
+            if (!end.oom_line.empty()) std::fprintf(stderr, "%s\n", end.oom_line.c_str());
             return false;
         }
         for (int i = n - 1; i >= 1; --i) parts[(size_t) i - 1]->split_next_ = std::move(owned[(size_t) i]);
@@ -1330,15 +1324,12 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->profile_path_ = profile_path_;   // every part reads the same profile
         m->head_half_ = i == helper;
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
-            if (m->tier_oom_) {   // (the line with the tiers of the parts loaded and this one's)
-                int64_t total = 0;
-                bool manual = false;
-                for (const Glm5Model* p = this; p != nullptr; p = p == m ? nullptr : p->split_next_.get()) {
-                    total += std::max<int64_t>(0, p->tier_try_b_);
-                    manual = manual || p->tier_manual_;
-                }
-                tier_oom_report(total, manual);
-            }
+            // (the line with the tiers of the parts loaded and this one's)
+            std::vector<glmfast::SplitPartEnd> ends;
+            for (const Glm5Model* p = this; p != nullptr; p = p == m ? nullptr : p->split_next_.get())
+                ends.push_back({p != m, p == m ? err : std::string(), p->tier_try_b_, p->tier_manual_, p->tier_oom_});
+            const glmfast::SplitStartEnd end = glmfast::split_start_end({}, ends);
+            if (!end.oom_line.empty()) std::fprintf(stderr, "%s\n", end.oom_line.c_str());
             if (prev != nullptr) prev->split_next_.reset();
             return false;
         }

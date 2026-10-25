@@ -371,18 +371,6 @@ inline RamTierSizing ram_tier_sizing(bool staging_only, bool fixed_ram, bool bud
 //   - one GPU (no split) never takes the gate: its path has no wait at all
 //   - an aborted split (a part failed, SplitSync::fail): every waiter wakes without a turn, and no turn is given after -
 //     a begin_ returns false then.  A turn already held runs on and is given back as before
-// The start's line when it failed for want of pinned memory - a RAM tier's pin refused, or a warm-up out of memory
-// (warm_oom_class) - with the RAM tiers this start set out to pin (all GPUs, GB of 2^30 bytes) and whether their size
-// was not the engine's own choice (ram_tier_sizing: STRATA_GLM_RAM_GB, the API's budget, RAM-resident).  Within one
-// process the tier cannot pin again what it gave back (Windows: ~32 GB unpinned, then not even 256 MB pinned), so
-// serve/server.py starts the engine again with a smaller STRATA_GLM_RAM_GB from it (ram_retry_gb) - manual=0 only
-inline std::string ram_tier_oom_line(int64_t total_bytes, bool manual) {
-    char b[96];
-    std::snprintf(b, sizeof b, "glm fast: RAM-TIER-OOM total_gb=%.2f manual=%d",
-                  (double) std::max<int64_t>(0, total_bytes) / 1073741824.0, manual ? 1 : 0);
-    return b;
-}
-
 class WarmGate {
 public:
     bool begin_warm() {
@@ -528,5 +516,57 @@ private:
     bool aborted_ = false;
     std::atomic<bool> aborted_flag_{false};   // (aborted_, read without the lock: a warm-up's poll)
 };
+
+// The start's line when it failed for want of pinned memory - a RAM tier's pin refused, or a warm-up out of memory
+// (warm_oom_class) - with the RAM tiers this start set out to pin (all GPUs, GB of 2^30 bytes) and whether their size
+// was not the engine's own choice (ram_tier_sizing: STRATA_GLM_RAM_GB, the API's budget, RAM-resident).  Within one
+// process the tier cannot pin again what it gave back (Windows: ~32 GB unpinned, then not even 256 MB pinned), so
+// serve/server.py starts the engine again with a smaller STRATA_GLM_RAM_GB from it (ram_retry_gb) - manual=0 only
+inline std::string ram_tier_oom_line(int64_t total_bytes, bool manual) {
+    char b[96];
+    std::snprintf(b, sizeof b, "glm fast: RAM-TIER-OOM total_gb=%.2f manual=%d",
+                  (double) std::max<int64_t>(0, total_bytes) / 1073741824.0, manual ? 1 : 0);
+    return b;
+}
+
+// A split start's end when a part failed (glm_model.cu's load_pack_split, the parallel load and the sequential one):
+// the error of the part that failed first, the later failures' after "; then " - the parts the abort stopped are no
+// failures (SplitSync::failures leaves them out) - and, when that first failure was short of pinned memory (tier_oom),
+// the RAM-TIER-OOM line with every given part's tier: total = the sum of max(0, tier_try_b) (-1: the part planned
+// none), manual = any part's.  `failed`: the parts that failed of their own, in order (SplitSync::failures; out of
+// range ignored); empty - the first part not ok stands for it.  No part failed: failed false, no error, no line
+struct SplitPartEnd {
+    bool ok = true;
+    std::string err;
+    int64_t tier_try_b = -1;
+    bool tier_manual = false;
+    bool tier_oom = false;
+};
+struct SplitStartEnd {
+    bool failed = false;
+    std::string err;
+    std::string oom_line;   // (empty: none)
+};
+inline SplitStartEnd split_start_end(std::vector<int> failed, const std::vector<SplitPartEnd>& parts) {
+    SplitStartEnd out;
+    const int n = (int) parts.size();
+    failed.erase(std::remove_if(failed.begin(), failed.end(), [n](int i) { return i < 0 || i >= n; }), failed.end());
+    for (int i = 0; i < n && failed.empty(); ++i)
+        if (!parts[(size_t) i].ok) failed.push_back(i);
+    if (failed.empty()) return out;
+    out.failed = true;
+    out.err = parts[(size_t) failed[0]].err;
+    for (size_t k = 1; k < failed.size(); ++k) out.err += "; then " + parts[(size_t) failed[k]].err;
+    if (parts[(size_t) failed[0]].tier_oom) {
+        int64_t total = 0;
+        bool manual = false;
+        for (const SplitPartEnd& p : parts) {
+            total += std::max<int64_t>(0, p.tier_try_b);
+            manual = manual || p.tier_manual;
+        }
+        out.oom_line = ram_tier_oom_line(total, manual);
+    }
+    return out;
+}
 
 }  // namespace strata::core::glmfast
