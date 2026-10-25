@@ -455,7 +455,7 @@ static void numa_pinned_free(void* p, size_t bytes) {
 
 // The RAM tier's sizing pins through these: STRATA_GLM_PIN_CAP_MB=<MB> (tests) refuses what would take the bytes they
 // hold past it - a Windows pinning cap where there is none.  (The parts of a split pin one after another.)
-static int64_t g_pin_held = 0;
+static std::atomic<int64_t> g_pin_held{0};   // (atomic: a warm-up's retry pins while another part's threads run)
 static cudaError_t pin_alloc(void** p, size_t bytes, unsigned flags) {
     static const int64_t cap = getenv("STRATA_GLM_PIN_CAP_MB") ? std::atoll(getenv("STRATA_GLM_PIN_CAP_MB")) << 20 : -1;
     if (cap >= 0 && g_pin_held + (int64_t) bytes > cap) return cudaErrorMemoryAllocation;
@@ -1841,7 +1841,85 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (F->ahead_read)
             for (int i = 0; i < 2; ++i) F->ah_th.emplace_back([this] { fast_ahead_reader(); });
         const char* wv = getenv("STRATA_GLM_WARM");
-        if ((wv == nullptr || std::atoi(wv) != 0) && !fast_warm(err)) return false;
+        // A warm-up that runs out of memory (a copy or the tables' upload: the tier pinned too near what the driver and
+        // Windows can still lock - a start with MAYA_GLM_RAM_HEADROOM_GB=3 on two GPUs and 64 GB): an auto-sized tier
+        // gives some slots back, up to kWarmRetryMax times, and the warm-up runs again (glmfast::warm_retry_slots).  A
+        // size set by hand (STRATA_GLM_RAM_GB, the API's budget) fails with the error, as before.
+        const bool tier_auto = !staging_only && !fixed_ram && ram_budget_ < 0 && !F->ram_resident;
+        const auto retier = [&](const std::vector<int64_t>& to) {
+            const auto fail_pin = [&](size_t c) {
+                err = "glm fast: the pinned RAM tier did not allocate again after the warm-up ran out of memory (class " +
+                      std::to_string(c) + ")";
+                return false;
+            };
+            // the old arenas go first: the smaller ones pin in the room they leave
+            for (size_t c = 0; c < n_cls; ++c) {
+                unpin(c, F->rc[c].n);
+                F->rc[c].base = nullptr;
+                F->rc[c].n = 0;
+            }
+            F->ram_bytes = 0;
+            for (size_t c = 0; c < n_cls; ++c) {
+                auto& R = F->rc[c];
+                int64_t n = to[c];
+                while (!pin(c, n)) {
+                    if (n <= c_least[c]) return fail_pin(c);
+                    n = std::max<int64_t>(c_least[c], n * 7 / 8);
+                }
+                R.registered = cls_reg[c] != 0;
+                R.base = (uint8_t*) cls_p[c];
+                R.n = (int) n;
+                R.key.assign((size_t) n, -1);
+                R.st.assign((size_t) n, FastState::kRFree);
+                R.tick.assign((size_t) n, 0);
+                F->ram_bytes += (size_t) n * R.stride;
+            }
+            // what the failed try left: the slot tables, the pool's slots and the lookahead's load words
+            std::fill(F->slot_of.begin(), F->slot_of.end(), -1);
+            std::fill(F->ram_of.begin(), F->ram_of.end(), -1);
+            for (int il = l0_; il < lt_; ++il)
+                if (F->L[(size_t) il].moe) {
+                    auto& P = F->lp[(size_t) il];
+                    P.key.assign((size_t) P.n, -1);
+                    P.st.assign((size_t) P.n, FastState::kFree);
+                }
+            F->rload.clear();
+            for (auto& R : F->rc) {
+                F->rload.emplace_back(new std::atomic<uint64_t>[(size_t) R.n]);
+                for (int s = 0; s < R.n; ++s) F->rload.back()[(size_t) s].store(0);
+            }
+            if (pf_ != nullptr) {
+                double held = (double) F->ram_bytes, all = 0;
+                for (int il = l0_; il < lt_; ++il)
+                    if (F->L[(size_t) il].moe) {
+                        const auto& P = F->lp[(size_t) il];
+                        all += (double) g.n_expert * (double) P.stride;
+                        held += (double) std::min(g.n_expert, P.n) * (double) P.stride;
+                    }
+                prefill_settle(all > 0 ? std::min(1.0, held / all) : 1.0);
+            }
+            return true;
+        };
+        for (int tries = 0; wv == nullptr || std::atoi(wv) != 0; ++tries) {
+            if (fast_warm(err)) break;
+            std::vector<int64_t> have(n_cls), strd(n_cls);
+            int64_t was = 0, now = 0;
+            for (size_t c = 0; c < n_cls; ++c) {
+                have[c] = F->rc[c].n;
+                strd[c] = (int64_t) F->rc[c].stride;
+                was += have[c] * strd[c];
+            }
+            const std::vector<int64_t> to = glmfast::warm_retry_slots(tier_auto, F->warm_cuda_err, tries, have, strd, c_least);
+            if (to.empty()) return false;
+            for (size_t c = 0; c < n_cls; ++c) now += to[c] * strd[c];
+            std::fprintf(stderr, "glm fast: CUDA%d warm-up out of memory - RAM tier %.2f -> %.2f GB, retrying (%d of %d)\n",
+                         dev_, (double) was / 1073741824.0, (double) now / 1073741824.0, tries + 1, glmfast::kWarmRetryMax);
+            if (!retier(to)) return false;
+            int64_t slots = 0;
+            for (const auto& R : F->rc) slots += R.n;
+            std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,
+                         (double) F->ram_bytes / 1073741824.0, (long long) slots);
+        }
 #ifdef _WIN32
         // #56: which node the tier drew this start - visibility only, the engine cannot place it.  Only on a PC with two
         // NUMA nodes or more: on one node it tells nothing, and its "node 0 of 2 seen" (2: the tier's blocks, one an

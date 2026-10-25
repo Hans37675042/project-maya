@@ -294,4 +294,49 @@ inline int64_t scaled_slots(int64_t n, int64_t least, double scale) {
     return scale < 1.0 ? std::max(least, (int64_t) ((double) n * scale)) : n;
 }
 
+// A warm-up that runs out of memory (a copy or the tables' upload answers "out of memory" when the RAM tier is pinned
+// too near what the driver and Windows can still lock for their own buffers): a RAM tier SIZED BY THE ENGINE gives
+// some of its slots back and the warm-up runs again - at most kWarmRetryMax times, each a step smaller.  A size the user
+// set (STRATA_GLM_RAM_GB) is theirs: that start fails with the error, as it always did.
+constexpr int kWarmRetryMax = 4;
+constexpr int kCudaOutOfMemory = 2;   // cudaErrorMemoryAllocation, and hipErrorOutOfMemory
+inline bool warm_oom_class(int code) {
+    return code == kCudaOutOfMemory;
+}
+// The slots each class of the RAM tier keeps for the next try, after `tries` retries already ran (n, stride and least:
+// the classes' pinned slots, slot bytes and floors) - empty: no retry (a manual size, another error, out of tries, or
+// the tier is at its floors).  The step is 1 GiB or 5% of the tier, whichever is more; what a class holds above its
+// floor shrinks by one common factor, so the floors are reached together and never passed.  Every retry is smaller.
+inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int tries, const std::vector<int64_t>& n,
+                                             const std::vector<int64_t>& stride, const std::vector<int64_t>& least) {
+    const size_t C = n.size();
+    if (!auto_sized || !warm_oom_class(code) || tries >= kWarmRetryMax || stride.size() != C || least.size() != C)
+        return {};
+    int64_t have = 0, floor_b = 0;
+    std::vector<int64_t> keep(C);   // a class's floor (or all of it, where it holds less)
+    for (size_t c = 0; c < C; ++c) {
+        keep[c] = std::min(n[c], least[c]);
+        have += n[c] * stride[c];
+        floor_b += keep[c] * stride[c];
+    }
+    if (have <= floor_b) return {};
+    const int64_t step = std::max<int64_t>(int64_t{1} << 30, have / 20);
+    const int64_t target = std::max(floor_b, have - step);
+    const double f = (double) (target - floor_b) / (double) (have - floor_b);
+    std::vector<int64_t> out(C);
+    bool less = false;
+    for (size_t c = 0; c < C; ++c) {
+        out[c] = keep[c] + (int64_t) ((double) (n[c] - keep[c]) * f);
+        less = less || out[c] < n[c];
+    }
+    if (!less) {   // (a step under one slot of any class: the biggest class above its floor gives one up)
+        size_t b = C;
+        for (size_t c = 0; c < C; ++c)
+            if (out[c] > keep[c] && (b == C || (out[c] - keep[c]) * stride[c] > (out[b] - keep[b]) * stride[b])) b = c;
+        if (b == C) return {};
+        --out[b];
+    }
+    return out;
+}
+
 }  // namespace strata::core::glmfast
