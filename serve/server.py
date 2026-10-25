@@ -4146,8 +4146,8 @@ def main() -> int:
                   "in an admin PowerShell:\n         New-NetFirewallRule -DisplayName \"Maya " + str(a.port) + "\" "
                   "-Direction Inbound -Protocol TCP -LocalPort " + str(a.port) + " -Action Allow -Profile Private\n"
                   "       (and set this network to Private in Windows' network settings)", flush=True)
-    if a.open:
-        import webbrowser
+    if a.open and cfg.get("open_browser") is not False:   # the config's "open_browser": false wins (a run-*.bat
+        import webbrowser                                  # still passes --open)
         webbrowser.open(f"http://{'127.0.0.1' if a.host in ('0.0.0.0', '') else a.host}:{a.port}/")
     # SIGTERM (llama-swap's cmdStop, systemd), SIGHUP (the terminal closed), Ctrl+C, Windows' Ctrl+Break and - with
     # --parent-pipe - the end of maya.py (watch_parent) end the server alike: the engine gets QUIT and time to keep its

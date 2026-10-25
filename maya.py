@@ -2797,7 +2797,7 @@ def server_command(cfg_path: Path, a) -> tuple:
         cmd += ["--api-key", a.api_key]
     if a.gpus or a.gpu is not None:                    # this start only, on these cards
         cmd += ["--gpu", str(a.gpus or a.gpu)]
-    if WIN or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+    if (WIN or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and cfg.get("open_browser") is not False:
         cmd.append("--open")                           # a desktop: the browser opens when the model is ready
     here = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
     ctx = args[args.index("--max-context") + 1] if "--max-context" in args[:-1] else None
