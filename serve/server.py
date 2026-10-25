@@ -476,7 +476,8 @@ class StrataEngine:
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
         # a start that runs out of pinned RAM (the engine's RAM-TIER-OOM line) starts again with a smaller tier
-        # (ram_retry_gb); a size that worked is kept for the restarts after a crash (restart())
+        # (ram_retry_gb); a size that worked is kept for the restarts after a crash (restart()).  The line is read from
+        # the log: without one (log=None) no start is ever restarted - maya.py always gives the engine a log
         ram_try = getattr(self, "ram_auto_gb", None)
         restarts = 0
         while True:
@@ -535,7 +536,8 @@ class StrataEngine:
         return gone
 
     def _log_since(self, offset: int, most: int = 256 << 10) -> str:
-        """The engine log from `offset` (this start's), its last `most` bytes at most; empty without a log."""
+        """The engine log from `offset` (this start's), its last `most` bytes at most; empty without a log (log=None:
+        then no RAM-TIER-OOM line is ever found, and a start short of pinned RAM is not restarted)."""
         if not self.log_path:
             return ""
         try:
