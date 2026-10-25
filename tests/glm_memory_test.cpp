@@ -135,10 +135,7 @@ bool old_tier(PinSim& s, const std::vector<int64_t>& cls_n, const std::vector<in
 // Checks added for the dual-GPU pin tier.  A check named in kKnownFail is a finding the current code does not meet
 // and this round does not fix: it must still be red (an expected failure), and the run fails if it turns green.
 // STRATA_TEST_NO_XFAIL=1 reports those as plain failures.
-const std::set<std::string> kKnownFail = {
-    "dual2.floors_fit_all_parts_start",
-    "dual3.floors_fit_all_parts_start",
-};
+const std::set<std::string> kKnownFail = {};
 int g_checks = 0, g_xfail = 0, g_bad = 0;
 void check(const char* id, bool ok, const std::string& detail = "") {
     ++g_checks;
@@ -517,6 +514,43 @@ int main() {
             const bool ok = pin_part(s, p, p.plan, kRoom, 5 * kGi, kRoom, true);
             check("tier.later_probe_exact_no_repin", ok && !p.tp.repinned && p.tp.later_measured && p.tp.later_scale == 1.0 &&
                                                          p.tp.n[0] == p.plan[0]);
+        }
+    }
+    {   // A split's part keeps the floors (guarded: later parts, or a reserve over one GPU's room); one GPU does not
+        const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+        const int64_t keep3 = 3 * kRoom;
+        {   // the last part: its first class would pin whole and leave the next one less than its floor
+            Part p({9 * kGi, 21 * kGi}, st);
+            PinSim s{p.plan[0] * p.stride[0] + keep3 + 64 * kMi, 0};
+            const bool ok = pin_part(s, p, p.plan, keep3, 0, keep3, false);
+            check("guard.last_part_leaves_next_class_floor",
+                  ok && p.tp.n[0] >= 16 && p.tp.n[0] < p.plan[0] && p.tp.n[1] >= 16 && s.held + keep3 <= s.cap,
+                  "ok=" + std::to_string(ok) + " n0=" + std::to_string(p.tp.n.empty() ? -1 : p.tp.n[0]) + " n1=" +
+                      std::to_string(p.tp.n.size() < 2 ? -1 : p.tp.n[1]));
+            // ... the same cap on one GPU (the room kept 512 MiB, no later parts) is v1.1.20's: the first class pins whole
+            Part q({9 * kGi, 21 * kGi}, st);
+            PinSim a{s.cap, 0}, b{s.cap, 0};
+            std::vector<int64_t> ref;
+            const bool ok_ref = old_tier(a, q.plan, q.stride, ref);
+            const bool ok_new = pin_part(b, q, q.plan, kRoom, 0, kRoom, false);
+            check("guard.one_gpu_same_cap_as_v1120", ok_new == ok_ref && a.held == b.held && (!ok_new || q.tp.n == ref),
+                  "new=" + std::to_string(ok_new) + " old=" + std::to_string(ok_ref));
+        }
+        {   // a part with a later part: its first class would pin whole and leave the later part under its floors
+            Part p({9 * kGi, 21 * kGi}, st);
+            const int64_t later = 13 * kGi, later_floors = 16 * (st[0] + st[1]), reserve = keep3 + 64 * kMi;
+            PinSim s{p.plan[0] * p.stride[0] + reserve + later_floors / 2, 0};
+            const bool ok = pin_part(s, p, p.plan, keep3, later, reserve, false);
+            check("guard.part_leaves_later_floors",
+                  ok && p.tp.n[0] >= 16 && p.tp.n[1] >= 16 && s.held + reserve + later_floors <= s.cap,
+                  "ok=" + std::to_string(ok) + " held=" + gib(s.held) + " cap=" + gib(s.cap));
+        }
+        {   // a cap that cannot hold even the floors still fails the start, and holds nothing it could not keep
+            Part p({9 * kGi, 21 * kGi}, st);
+            PinSim s{keep3 + 16 * st[0], 0};
+            const bool ok = pin_part(s, p, p.plan, keep3, 0, keep3, false);
+            check("guard.cap_under_floors_fails", !ok && s.held + keep3 <= s.cap && s.held == p.pinned(),
+                  "ok=" + std::to_string(ok) + " held=" + gib(s.held) + " pinned=" + gib(p.pinned()));
         }
     }
     {   // One, two and three GPUs under a pinning cap.  Spec: every part gets > 0 of every class, the total plus the room

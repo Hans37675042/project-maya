@@ -145,6 +145,11 @@ inline int warm_pool_slots(bool unified, int slots, int experts, int spares) {
 // measure_later (once a split, on its first part): when no refusal measured the room, it is measured after the tier
 // for the later parts, and a tier that leaves them short is pinned again at its share.  Each class of one GPU (later
 // 0, the reserve the room kept above it) keeps exactly the steps it always had.
+// A split's part (later > 0, or a reserve over one GPU's room: "guarded") also keeps the floors: a class that pins
+// before any refusal must leave the floors of the classes after it and of the later parts (and the reserve) still
+// pinnable, or it is unpinned and takes its share of the measured room; and a share is the floor plus its part of
+// what is left beyond all the floors, so a cap that holds every floor gives every class of every part its floor.
+// (The later parts' floors are estimated from this part's: its floors for each multiple of its plan they plan.)
 struct TierPin {
     std::vector<int64_t> n;       // the slots each class got (n[c] 0: class c did not pin, the start fails)
     int64_t pin_left = -1;        // the room measured under the cap less the classes pinned since (-1: none measured)
@@ -154,6 +159,7 @@ struct TierPin {
     double later_scale = 1.0;     // the share of their plans the later parts have room for
 };
 constexpr int64_t kPinProbeStep = int64_t{256} << 20;   // pin_room's smallest probe
+constexpr int64_t kPinRoomOneGpu = int64_t{512} << 20;   // kPinRoom (glm_fast_path.cu): the room one GPU keeps above its tier
 template <class Pin, class Unpin, class Room>
 inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, const std::vector<int64_t>& stride,
                              const std::vector<int64_t>& least, int64_t later, int64_t reserve, bool measure_later,
@@ -165,7 +171,28 @@ inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, 
         for (size_t k = c; k < C; ++k) rest += planned[k] * stride[k];
         return rest;
     };
+    // a split's part (see above); one GPU, and a split without a cap, are not: their steps are v1.1.20's
+    const bool guarded = later > 0 || reserve > kPinRoomOneGpu;
+    int64_t own_least = 0, own_plan = 0;   // this part's floors and plan, bytes
+    for (size_t k = 0; k < C; ++k) {
+        own_least += least[k] * stride[k];
+        own_plan += planned[k] * stride[k];
+    }
+    const int64_t later_least =
+        later > 0 ? std::min(later, own_least * ((later + std::max<int64_t>(1, own_plan) - 1) / std::max<int64_t>(1, own_plan))) : 0;
+    const auto least_from = [&](size_t c) {   // the floors, in bytes, of the classes from class c on
+        int64_t b = 0;
+        for (size_t k = c; k < C; ++k) b += least[k] * stride[k];
+        return b;
+    };
     const auto share = [&](size_t c) {
+        if (guarded) {   // the floor, and its part of the room beyond every floor (the later parts' with them)
+            int64_t extra = later - later_least;
+            for (size_t k = c; k < C; ++k) extra += std::max<int64_t>(0, planned[k] - least[k]) * stride[k];
+            const int64_t spare = out.pin_left - reserve - least_from(c) - later_least;
+            const double f = spare > 0 ? std::min(1.0, (double) spare / (double) std::max<int64_t>(1, extra)) : 0.0;
+            return least[c] + (int64_t) (f * (double) std::max<int64_t>(0, planned[c] - least[c]));
+        }
         const double f = (double) std::max<int64_t>(0, out.pin_left - reserve) / (double) std::max<int64_t>(1, rest_of(c));
         return (int64_t) (f * (double) planned[c]);
     };
@@ -179,7 +206,18 @@ inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, 
             // a refusal near a pinning cap: the size measured, and should that be refused too, 1/32 less a try for
             // the first four (a tier just over a cap loses ~3%, not the 12% of a 7/8 step), then 1/8 less
             for (int tries = 0; n >= lo; ++tries) {
-                if (pin(c, n)) {
+                bool pinned = pin(c, n), held_back = false;
+                if (pinned && guarded && out.pin_left < 0) {
+                    // before any refusal: what is left must still pin the floors after this class, the reserve, and
+                    // (but the first part, whose probe after the tier measures the later parts) the later parts' floors
+                    const int64_t need = least_from(c + 1) + (measure_later ? 0 : later_least) + reserve;
+                    if (room((need + kPinProbeStep - 1) / kPinProbeStep * kPinProbeStep, true) < need) {
+                        unpin(c, n);
+                        pinned = false;
+                        held_back = true;
+                    }
+                }
+                if (pinned) {
                     ok = true;
                     break;
                 }
@@ -190,6 +228,7 @@ inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, 
                         n = std::max(lo, fit);
                         continue;
                     }
+                    if (held_back) continue;   // (the room is measured now: the same size pins in its share)
                 }
                 const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
                 n = (n > lo && less < lo) ? lo : less;
@@ -214,6 +253,15 @@ inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, 
         for (size_t c = 0; c < C; ++c) own += out.n[c] * stride[c];
         for (size_t c = 0; c < C; ++c) unpin(c, out.n[c]);
         out.pin_left = own + r;
+        out.repinned = true;
+        if (!run()) return false;
+    }
+    if (guarded && later > 0 && !out.repinned && out.pin_left >= 0 && out.pin_left - reserve < later_least) {
+        // a refusal measured the room, but this tier left the later parts under their floors: pin again at its share
+        int64_t own = 0;
+        for (size_t c = 0; c < C; ++c) own += out.n[c] * stride[c];
+        for (size_t c = 0; c < C; ++c) unpin(c, out.n[c]);
+        out.pin_left += own;
         out.repinned = true;
         if (!run()) return false;
     }
