@@ -346,14 +346,17 @@ inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int trie
     return out;
 }
 // How a part's RAM tier was sized (fast_setup), from one place: `manual` - its size was not the engine's own choice
-// (the RAM-TIER-OOM line's manual=1); `auto_sized` - a warm-up out of memory may shrink it in-engine (warm_retry_slots)
+// (STRATA_GLM_RAM_GB, the API's budget, a RAM-resident tier): the RAM-TIER-OOM line's manual=1, which the launcher does
+// not restart from; `auto_sized` - a warm-up out of memory may shrink it in-engine (warm_retry_slots).  A staging-only
+// tier (minimal_ram_tier: every expert fits in the pool) is the engine's own choice - not manual, its size still counts
+// in the line's total - but it is at its floors already, so it never shrinks in-engine either
 struct RamTierSizing {
     bool manual = false;
     bool auto_sized = false;
 };
 inline RamTierSizing ram_tier_sizing(bool staging_only, bool fixed_ram, bool budget_set, bool ram_resident) {
-    const bool manual = staging_only || fixed_ram || budget_set || ram_resident;
-    return {manual, !manual};
+    const bool manual = fixed_ram || budget_set || ram_resident;
+    return {manual, !manual && !staging_only};
 }
 
 // A split's warm-ups and their retries' re-pins (fast_setup).  The parts warm up at once, but a part whose warm-up ran
@@ -370,7 +373,7 @@ inline RamTierSizing ram_tier_sizing(bool staging_only, bool fixed_ram, bool bud
 //     a begin_ returns false then.  A turn already held runs on and is given back as before
 // The start's line when it failed for want of pinned memory - a RAM tier's pin refused, or a warm-up out of memory
 // (warm_oom_class) - with the RAM tiers this start set out to pin (all GPUs, GB of 2^30 bytes) and whether their size
-// was set by hand (STRATA_GLM_RAM_GB, the API's budget) or is not the auto size (staging only, RAM-resident).  Within one
+// was not the engine's own choice (ram_tier_sizing: STRATA_GLM_RAM_GB, the API's budget, RAM-resident).  Within one
 // process the tier cannot pin again what it gave back (Windows: ~32 GB unpinned, then not even 256 MB pinned), so
 // serve/server.py starts the engine again with a smaller STRATA_GLM_RAM_GB from it (ram_retry_gb) - manual=0 only
 inline std::string ram_tier_oom_line(int64_t total_bytes, bool manual) {
