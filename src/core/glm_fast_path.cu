@@ -492,10 +492,15 @@ static int64_t pin_room(int64_t limit) {
     return got;
 }
 
-// STRATA_GLM_PIN_DIAG=1 (a diagnosis, off by default - and then nothing below runs): what pins and how much RAM is free
-// around the RAM tier's pins, to tell pinned pages given back late after a free from physical pages run out.  A line is
-// "glm fast: CUDA<dev> pin-diag <when> [t=<s>] room=<GB that pin now, probed up to 40 GB and freed again> availphys=<the
-// free physical RAM, GB; -1 off Windows>"; a series is the line at once and 0.5, 2 and 5 s after its event
+// STRATA_GLM_PIN_DIAG=1 (a diagnosis, off by default - and then nothing below runs): what is pinned and how much RAM is
+// free around the RAM tier's pins, to tell pinned pages given back late after a free from physical pages run out.  A
+// reading must not disturb what it reads: it reports the bytes the tier's sizing holds pinned (g_pin_held) and the free
+// physical RAM, and pins nothing but one 256 MB probe, freed at once - the only pinning the diagnosis does (a room
+// measured by pinning up to 40 GB and freeing it again took the very pages whose late release it looked for, and could
+// cause the refusal itself).  The line: glmfast::pin_diag_text.  A series is the line at once and 0.5, 2 and 5 s after
+// its event: before-tier (each part, before its small buffers and tier pin), after-measure (a split's part that measured
+// the room for the later parts), after-refusal (a refused pin, or a room measured at 0) and after-unpin (a warm-up
+// retry's tier given back)
 static bool pin_diag_on() {
     static const bool on = [] {
         const char* v = getenv("STRATA_GLM_PIN_DIAG");
@@ -504,21 +509,23 @@ static bool pin_diag_on() {
     return on;
 }
 static void pin_diag_line(int dev, const char* when, double t) {
-    const int64_t r = pin_room((int64_t) 40 << 30);   // (pin_alloc / pin_free: g_pin_held as it was)
+    const int64_t held = g_pin_held.load();
     double avail = -1.0;
 #ifdef _WIN32
     MEMORYSTATUSEX ms{};
     ms.dwLength = sizeof ms;
     if (GlobalMemoryStatusEx(&ms)) avail = (double) ms.ullAvailPhys / 1073741824.0;
 #endif
-    char at[32] = "";
-    if (t >= 0) std::snprintf(at, sizeof at, " t=%g", t);
-    if (avail >= 0)
-        std::fprintf(stderr, "glm fast: CUDA%d pin-diag %s%s room=%.2f availphys=%.2f\n", dev, when, at,
-                     (double) r / 1073741824.0, avail);
-    else
-        std::fprintf(stderr, "glm fast: CUDA%d pin-diag %s%s room=%.2f availphys=-1\n", dev, when, at,
-                     (double) r / 1073741824.0);
+    void* p = nullptr;   // (the probe: pin_alloc / pin_free - g_pin_held as it was)
+    const size_t probe_b = (size_t) glmfast::kPinProbeStep;
+    int probe = 0;
+    if (pin_alloc(&p, probe_b, cudaHostAllocDefault) == cudaSuccess) {
+        pin_free(p, probe_b);
+        probe = 1;
+    } else {
+        cudaGetLastError();
+    }
+    std::fprintf(stderr, "%s\n", glmfast::pin_diag_text(dev, when, t, held, avail, probe).c_str());
 }
 static void pin_diag_series(int dev, const char* when) {
     const auto t0 = std::chrono::steady_clock::now();
@@ -1692,7 +1699,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             // part measures for all of them (below), so the last one is not left whatever the first ones did not take
             if (!split_load_->wait_pin(part_)) return split_stop(err);
         }
-        if (pin_diag_on()) pin_diag_line(dev_, "before-tier", -1.0);
+        if (pin_diag_on()) pin_diag_series(dev_, "before-tier");
         // the small pinned buffers first - the table updates and the disk reads' staging (an expert a routed entry):
         // where the driver caps what can be pinned (Windows: an RTX 5090 Laptop with 64 GB, the cap reached at a 45.3
         // GB tier, #67) the tier below shrinks to fit instead of the start failing on them after it
@@ -1748,7 +1755,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         std::vector<void*> cls_p(n_cls, nullptr);
         std::vector<char> cls_reg(n_cls, 0);
-        // (STRATA_GLM_PIN_DIAG: a refused pin, or a room measured at 0 - a series for the first three, a line after)
+        // (STRATA_GLM_PIN_DIAG: a refused pin, or a room measured at 0.  Decided: the full series for the first three
+        // refusals of this fast_setup, a single line (t=0) for each one after - a series takes 5 s, and the steps down
+        // through the classes can be refused many times over)
         int diag_series = 3;
         const auto diag_refused = [&] {
             if (!pin_diag_on()) return;

@@ -549,6 +549,18 @@ inline std::string ram_tier_oom_line(int64_t total_bytes, bool manual) {
     return b;
 }
 
+// STRATA_GLM_PIN_DIAG's line (glm_fast_path.cu's pin_diag_line): "glm fast: CUDA<dev> pin-diag <when> t=<s after the
+// event> held=<GB the RAM tier's sizing holds pinned now> availphys=<GB of free physical RAM; -1 off Windows>
+// probe256=<1: a 256 MB probe pinned (and was freed again), 0: refused, -: not probed>"
+inline std::string pin_diag_text(int dev, const char* when, double t, int64_t held_b, double avail_gb, int probe) {
+    char b[192], av[32];
+    if (avail_gb >= 0) std::snprintf(av, sizeof av, "%.2f", avail_gb);
+    else std::snprintf(av, sizeof av, "-1");
+    std::snprintf(b, sizeof b, "glm fast: CUDA%d pin-diag %s t=%g held=%.2f availphys=%s probe256=%s", dev, when, t,
+                  (double) std::max<int64_t>(0, held_b) / 1073741824.0, av, probe < 0 ? "-" : probe ? "1" : "0");
+    return b;
+}
+
 // A split start's end when a part failed (glm_model.cu's load_pack_split, the parallel load and the sequential one):
 // the error of the part that failed first, the later failures' after "; then " - the parts the abort stopped are no
 // failures (SplitSync::failures leaves them out) - and, when that first failure was short of pinned memory (tier_oom),
