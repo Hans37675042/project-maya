@@ -136,7 +136,6 @@ bool old_tier(PinSim& s, const std::vector<int64_t>& cls_n, const std::vector<in
 // and this round does not fix: it must still be red (an expected failure), and the run fails if it turns green.
 // STRATA_TEST_NO_XFAIL=1 reports those as plain failures.
 const std::set<std::string> kKnownFail = {
-    "scaled.plan_under_floor_not_over_plan",
     "dual2.floors_fit_all_parts_start",
     "dual3.floors_fit_all_parts_start",
 };
@@ -430,8 +429,10 @@ int main() {
                 sw.expect(scaled_slots(n, 16, sc + 0.0625) >= v || sc + 0.0625 >= 1.0, "monotone n=" + std::to_string(n));
             }
         check("scaled.in_floor_and_plan_range", sw.ok, sw.why());
-        // a plan already under the floor: the scaled count is 16 over a plan of 10 (the floor wins over the plan)
-        check("scaled.plan_under_floor_not_over_plan", scaled_slots(10, 16, 0.5) <= 10,
+        // a plan already under the floor: the floor wins over the plan (16, not 10; scaled.floor_cases pins the plan 0
+        // case; fast_setup never plans under the floor)
+        check("scaled.floor_wins_over_plan_under_floor",
+              scaled_slots(10, 16, 0.5) == 16 && scaled_slots(10, 16, 0.0) == 16 && scaled_slots(10, 16, 1.0) == 10,
               "scaled_slots(10, 16, 0.5) = " + std::to_string(scaled_slots(10, 16, 0.5)));
     }
     {   // pin_tier_classes, one part: boundaries and error paths
