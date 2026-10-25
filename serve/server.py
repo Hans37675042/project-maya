@@ -420,7 +420,8 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
 RAM_OOM_RE = re.compile(r"glm fast: RAM-TIER-OOM total_gb=(\d+(?:\.\d+)?) manual=([01])\b")
 RAM_RETRY_MAX = 3          # restarts after the first start
 RAM_RETRY_FLOOR_GB = 1.0   # no restart below this
-RAM_SET_KEYS = ("MAYA_GLM_RAM_GB", "STRATA_GLM_RAM_GB")
+RAM_SET_KEY = "STRATA_GLM_RAM_GB"   # the size the engine reads; users set it as MAYA_GLM_RAM_GB (tools/maya_names.py)
+RAM_SET_KEYS = (maya_names.shown(RAM_SET_KEY), RAM_SET_KEY)
 ENGINE_END_WAIT_S = 30.0   # a refused start's process ends within this (its output closed), or it is killed ...
 ENGINE_KILL_WAIT_S = 20.0  # ... and ends within this after the kill
 
@@ -549,7 +550,7 @@ class StrataEngine:
         """One start of the engine, until READY or its output closes (max_context stays 0); the log's offset before it.
         `ram_gb`: STRATA_GLM_RAM_GB for this start (a restart after the RAM tier ran out of pinned memory)."""
         if ram_gb is not None:
-            env = {**(env if env is not None else os.environ), "STRATA_GLM_RAM_GB": f"{ram_gb:g}"}
+            env = {**(env if env is not None else os.environ), RAM_SET_KEY: f"{ram_gb:g}"}
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
         if log:
