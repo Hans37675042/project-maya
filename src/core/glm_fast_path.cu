@@ -1703,10 +1703,15 @@ bool Glm5Model::fast_setup(std::string& err) {
         // the small pinned buffers first - the table updates and the disk reads' staging (an expert a routed entry):
         // where the driver caps what can be pinned (Windows: an RTX 5090 Laptop with 64 GB, the cap reached at a 45.3
         // GB tier, #67) the tier below shrinks to fit instead of the start failing on them after it
+        // (a refused pin here is short of pinned memory - the RAM-TIER-OOM line; a refused cudaMalloc is VRAM, not)
         if (cudaHostAlloc((void**) &F->upd_key_h, FastState::kMaxUpd * sizeof(int), cudaHostAllocDefault) != cudaSuccess ||
             cudaHostAlloc((void**) &F->upd_val_h, FastState::kMaxUpd * sizeof(unsigned long long),
-                          cudaHostAllocDefault) != cudaSuccess ||
-            cudaMalloc((void**) &F->upd_key_d, FastState::kMaxUpd * sizeof(int)) != cudaSuccess ||
+                          cudaHostAllocDefault) != cudaSuccess) {
+            err = "glm fast: the table update buffers did not allocate";
+            tier_oom_ = true;
+            return false;
+        }
+        if (cudaMalloc((void**) &F->upd_key_d, FastState::kMaxUpd * sizeof(int)) != cudaSuccess ||
             cudaMalloc((void**) &F->upd_val_d, FastState::kMaxUpd * sizeof(unsigned long long)) != cudaSuccess) {
             err = "glm fast: the table update buffers did not allocate";
             return false;
