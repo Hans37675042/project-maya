@@ -1587,7 +1587,9 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
         const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
         const bool fixed_ram = getenv("STRATA_GLM_RAM_GB") != nullptr;
-        tier_manual_ = staging_only || fixed_ram || ram_budget_ >= 0 || F->ram_resident;
+        const glmfast::RamTierSizing sizing = glmfast::ram_tier_sizing(staging_only, fixed_ram, ram_budget_ >= 0,
+                                                                       F->ram_resident);
+        tier_manual_ = sizing.manual;
         if (budget < 0) {
             if (total < 0) {
                 if (const char* rg = getenv("STRATA_GLM_RAM_GB")) {
@@ -1928,7 +1930,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // Windows can still lock - a start with MAYA_GLM_RAM_HEADROOM_GB=3 on two GPUs and 64 GB): an auto-sized tier
         // gives some slots back, up to kWarmRetryMax times, and the warm-up runs again (glmfast::warm_retry_slots).  A
         // size set by hand (STRATA_GLM_RAM_GB, the API's budget) fails with the error, as before.
-        const bool tier_auto = !staging_only && !fixed_ram && ram_budget_ < 0 && !F->ram_resident;
+        const bool tier_auto = sizing.auto_sized;
         // A split's parts warm up at once: a retry's re-pin takes the split's gate's exclusive turn - no other part warms
         // up or re-pins meanwhile (the room under a cap read while a card streams its experts in is 0.00 GB, the reason
         // for wait_pin above, and a re-pin there can take the pinned buffers another card's copy needs).  One GPU takes

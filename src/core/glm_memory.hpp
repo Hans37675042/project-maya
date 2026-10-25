@@ -345,6 +345,16 @@ inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int trie
     }
     return out;
 }
+// How a part's RAM tier was sized (fast_setup), from one place: `manual` - its size was not the engine's own choice
+// (the RAM-TIER-OOM line's manual=1); `auto_sized` - a warm-up out of memory may shrink it in-engine (warm_retry_slots)
+struct RamTierSizing {
+    bool manual = false;
+    bool auto_sized = false;
+};
+inline RamTierSizing ram_tier_sizing(bool staging_only, bool fixed_ram, bool budget_set, bool ram_resident) {
+    const bool manual = staging_only || fixed_ram || budget_set || ram_resident;
+    return {manual, !manual};
+}
 
 // A split's warm-ups and their retries' re-pins (fast_setup).  The parts warm up at once, but a part whose warm-up ran
 // out of memory pins its smaller tier again only while no other part warms up or re-pins: the room under a pinning
