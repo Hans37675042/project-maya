@@ -1507,6 +1507,33 @@ int main() {
             check("oomline.gap.reads_back", sw.ok, sw.why());
         }
     }
+    {   // a split part's load that ends anywhere but its success aborts the split there and then (SplitFailOnExit): the
+        // other parts stop at their next turn or phase boundary, not after loading all their weights
+        using strata::core::glmfast::SplitFailOnExit;
+        using strata::core::glmfast::SplitSync;
+        {
+            SplitSync s(2);
+            { SplitFailOnExit g(&s, 1); }   // (a failure exit: the VRAM pool, a file read, the sampler buffer)
+            check("splitfailexit.failure_exit_aborts_and_records", s.aborted() && s.gate.aborted() &&
+                                                                       s.failures() == std::vector<int>({1}) && !s.wait(0));
+        }
+        {
+            SplitSync s(2);
+            {
+                SplitFailOnExit g(&s, 0);
+                g.dismiss();   // the load succeeded
+            }
+            check("splitfailexit.success_does_not_abort", !s.aborted() && s.failures().empty());
+        }
+        {
+            SplitSync s(2);
+            s.fail(1);
+            s.stopped(0);   // part 0 stopped at a phase boundary on part 1's abort
+            { SplitFailOnExit g(&s, 0); }
+            check("splitfailexit.a_stopped_part_is_no_failure", s.failures() == std::vector<int>({1}));
+        }
+        { SplitFailOnExit none(nullptr, 0); }   // (one GPU, or the sequential split: nothing to abort)
+    }
     {   // a split start's end when a part failed (split_start_end): the earliest failure's error and the later ones after
         // "; then ", and the RAM-TIER-OOM line only when that earliest failure was short of pinned memory
         using strata::core::glmfast::split_start_end;
