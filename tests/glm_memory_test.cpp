@@ -652,6 +652,104 @@ int main() {
             if (np == 1) check("parity1.cap_flag_one_gpu_as_v1120", flag.ok, flag.why());
         }
     }
+    {   // Warm-up out of memory: an auto-sized RAM tier shrinks and the warm-up runs again (warm_retry_slots)
+        using strata::core::glmfast::kWarmRetryMax;
+        using strata::core::glmfast::warm_oom_class;
+        using strata::core::glmfast::warm_retry_slots;
+        constexpr int kOom = 2;   // cudaErrorMemoryAllocation, hipErrorOutOfMemory
+        const auto bytes = [](const std::vector<int64_t>& n, const std::vector<int64_t>& st) {
+            int64_t b = 0;
+            for (size_t c = 0; c < n.size(); ++c) b += n[c] * st[c];
+            return b;
+        };
+        check("warmretry.oom_class", warm_oom_class(kOom) && !warm_oom_class(0) && !warm_oom_class(1) &&
+                                         !warm_oom_class(700) && !warm_oom_class(719) && !warm_oom_class(-1));
+        check("warmretry.max_is_four", kWarmRetryMax == 4);
+        const std::vector<int64_t> st1 = {6656 * 1024}, least1 = {16};
+        const std::vector<int64_t> n30 = {(int64_t) (29.97 * (double) kGi) / st1[0]};   // the observed CUDA0 tier
+        const std::vector<int64_t> n13 = {(int64_t) (12.99 * (double) kGi) / st1[0]};   // ... and CUDA1's
+        {   // no retry unless auto-sized AND an out-of-memory error AND tries left
+            check("warmretry.manual_size_never_retries", warm_retry_slots(false, kOom, 0, n30, st1, least1).empty());
+            check("warmretry.other_error_never_retries", warm_retry_slots(true, 1, 0, n30, st1, least1).empty() &&
+                                                           warm_retry_slots(true, 0, 0, n30, st1, least1).empty() &&
+                                                           warm_retry_slots(true, 700, 0, n30, st1, least1).empty());
+            Sweep sw;
+            for (int t = 0; t < kWarmRetryMax; ++t) sw.expect(!warm_retry_slots(true, kOom, t, n30, st1, least1).empty(), "try " + std::to_string(t));
+            check("warmretry.tries_left_retry", sw.ok, sw.why());
+            check("warmretry.out_of_tries_gives_up", warm_retry_slots(true, kOom, kWarmRetryMax, n30, st1, least1).empty() &&
+                                                         warm_retry_slots(true, kOom, kWarmRetryMax + 7, n30, st1, least1).empty());
+            check("warmretry.negative_tries_is_zero", !warm_retry_slots(true, kOom, -3, n30, st1, least1).empty());
+        }
+        {   // the step: 1 GiB or 5% of the tier, whichever is more
+            const int64_t b30 = bytes(n30, st1), b13 = bytes(n13, st1);
+            const auto r30 = warm_retry_slots(true, kOom, 0, n30, st1, least1);
+            const auto r13 = warm_retry_slots(true, kOom, 0, n13, st1, least1);
+            const int64_t d30 = b30 - bytes(r30, st1), d13 = b13 - bytes(r13, st1);
+            check("warmretry.big_tier_loses_5pct", d30 >= b30 / 20 && d30 <= b30 / 20 + 2 * st1[0], "lost " + gib(d30) + " of " + gib(b30));
+            check("warmretry.small_tier_loses_1gib", d13 >= kGi && d13 <= kGi + 2 * st1[0], "lost " + gib(d13) + " of " + gib(b13));
+        }
+        {   // four retries from the observed tiers: each smaller, never under a floor, ends well above the floors
+            Sweep sw;
+            for (const auto& start : {n30, n13}) {
+                std::vector<int64_t> n = start;
+                for (int t = 0; t < kWarmRetryMax; ++t) {
+                    const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                    sw.expect(!r.empty() && r.size() == n.size() && r[0] < n[0] && r[0] >= least1[0], "step " + std::to_string(t));
+                    if (r.empty()) break;
+                    n = r;
+                }
+                sw.expect(bytes(n, st1) >= bytes(start, st1) * 60 / 100, "four steps lost more than 40%");
+                sw.expect(bytes(n, st1) <= bytes(start, st1) - 4 * kGi + 4 * st1[0], "four steps lost under 4 GiB");
+            }
+            check("warmretry.four_steps_shrink_and_stay_above_floor", sw.ok, sw.why());
+        }
+        {   // the floors: a tier at them cannot shrink; one just over goes to them exactly and no further
+            check("warmretry.at_floor_gives_up", warm_retry_slots(true, kOom, 0, {16}, st1, least1).empty() &&
+                                                     warm_retry_slots(true, kOom, 0, {3}, st1, least1).empty() &&
+                                                     warm_retry_slots(true, kOom, 0, {}, {}, {}).empty());
+            const auto r = warm_retry_slots(true, kOom, 0, {40}, st1, least1);
+            check("warmretry.near_floor_lands_on_floor", r.size() == 1 && r[0] == 16, r.empty() ? "empty" : std::to_string(r[0]));
+            const auto r2 = warm_retry_slots(true, kOom, 1, r, st1, least1);
+            check("warmretry.on_floor_then_gives_up", r2.empty());
+        }
+        {   // several size classes: every class shrinks in proportion, none under its own floor, none grows
+            const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024, 2 * kMi};
+            const std::vector<int64_t> lst = {16, 16, 16};
+            Sweep sw;
+            for (int64_t a = 16; a <= 6000; a += 487)
+                for (int64_t b = 16; b <= 4000; b += 311)
+                    for (int64_t c = 16; c <= 40; c += 12) {
+                        const std::vector<int64_t> n = {a, b, c};
+                        for (int t = 0; t < kWarmRetryMax; ++t) {
+                            const auto r = warm_retry_slots(true, kOom, t, n, st, lst);
+                            const std::string at = "n=" + std::to_string(a) + "/" + std::to_string(b) + "/" + std::to_string(c) + " t=" + std::to_string(t);
+                            const bool floors = a == 16 && b == 16 && c == 16;
+                            if (floors) {
+                                sw.expect(r.empty(), at + " shrank at the floors");
+                                continue;
+                            }
+                            if (r.empty()) {
+                                sw.expect(false, at + " gave up above the floors");
+                                continue;
+                            }
+                            sw.expect(r.size() == 3, at + " size");
+                            if (r.size() != 3) continue;
+                            bool less = false;
+                            for (size_t k = 0; k < 3; ++k) {
+                                sw.expect(r[k] <= n[k] && r[k] >= lst[k], at + " class " + std::to_string(k) + " " + std::to_string(r[k]));
+                                less = less || r[k] < n[k];
+                            }
+                            sw.expect(less, at + " no class shrank");
+                            sw.expect(bytes(r, st) < bytes(n, st), at + " bytes did not fall");
+                        }
+                    }
+            check("warmretry.multi_class_sweep", sw.ok, sw.why());
+        }
+        {   // a class already under its floor (a tiny class of one layer, cap 1) is left alone, the others still shrink
+            const auto r = warm_retry_slots(true, kOom, 0, {3, 4000}, {2 * kMi, 6656 * 1024}, {16, 16});
+            check("warmretry.class_under_floor_untouched", r.size() == 2 && r[0] == 3 && r[1] < 4000 && r[1] >= 16);
+        }
+    }
     std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
     if (g_bad) return 1;
     std::puts("GLM memory policy checks passed (CPU only)");
