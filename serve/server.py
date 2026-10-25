@@ -452,7 +452,7 @@ def ram_retry_gb(log_tail: str | None, env: dict, launcher_gb: float | None, res
     if launcher_gb is not None:
         total = min(total, launcher_gb)
     step = max(1.0, total * 0.05)
-    nxt = math.floor((total - step) * 2 + 1e-9) / 2
+    nxt = math.floor((total - step) * 2) / 2   # (2-decimal totals, 0.5 GB tries: never a float hair under a step)
     return nxt if nxt >= RAM_RETRY_FLOOR_GB else None
 
 
