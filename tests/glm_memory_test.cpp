@@ -3,7 +3,9 @@
 
 #undef NDEBUG   // the checks are asserts: keep them in Release builds
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -11,6 +13,7 @@
 #include <cstdlib>
 #include <set>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -547,6 +550,29 @@ int main() {
                   ok && p.tp.n[0] >= 16 && p.tp.n[1] >= 16 && s.held + reserve + later_floors <= s.cap,
                   "ok=" + std::to_string(ok) + " held=" + gib(s.held) + " cap=" + gib(s.cap));
         }
+        {   // a warm-up retry's re-pin on one GPU asks for the guard (guard true): the first class would pin whole and
+            // leave the next one under its floor - guarded, both keep their floors; unguarded (v1.1.20) the start fails
+            const auto run = [&](bool guard, Part& p, PinSim& s) {
+                return strata::core::glmfast::pin_tier_classes(
+                    p.tp, p.plan, p.stride, p.least, 0, kRoom, false,
+                    [&](size_t c, int64_t k) {
+                        const int64_t b = k * p.stride[c];
+                        if (s.held + b + kRoom > s.cap) return false;
+                        s.held += b;
+                        return true;
+                    },
+                    [&](size_t c, int64_t k) { s.held -= k * p.stride[c]; }, [&](int64_t limit, bool) { return s.room(limit); },
+                    guard);
+            };
+            Part p({9 * kGi, 21 * kGi}, st), q({9 * kGi, 21 * kGi}, st);
+            const int64_t cap = p.plan[0] * p.stride[0] + kRoom + 32 * kMi;
+            PinSim s{cap, 0}, t{cap, 0};
+            const bool ok = run(true, p, s), ok_old = run(false, q, t);
+            check("guard.forced_one_gpu_keeps_next_class_floor",
+                  ok && p.tp.n[0] >= 16 && p.tp.n[0] < p.plan[0] && p.tp.n[1] >= 16 && s.held + kRoom <= s.cap && !ok_old,
+                  "ok=" + std::to_string(ok) + " n0=" + std::to_string(p.tp.n.empty() ? -1 : p.tp.n[0]) + " n1=" +
+                      std::to_string(p.tp.n.size() < 2 ? -1 : p.tp.n[1]) + " unguarded ok=" + std::to_string(ok_old));
+        }
         {   // a cap that cannot hold even the floors still fails the start, and holds nothing it could not keep
             Part p({9 * kGi, 21 * kGi}, st);
             PinSim s{keep3 + 16 * st[0], 0};
@@ -658,7 +684,8 @@ int main() {
         using strata::core::glmfast::kWarmRetryMax;
         using strata::core::glmfast::warm_oom_class;
         using strata::core::glmfast::warm_retry_slots;
-        constexpr int kOom = 2;   // cudaErrorMemoryAllocation, hipErrorOutOfMemory
+        constexpr int kOom = strata::core::glmfast::kCudaOutOfMemory;   // the header's code, not a copy of it
+        check("warmretry.oom_code_is_cuda_and_hip_out_of_memory", kOom == 2);   // cudaErrorMemoryAllocation, hipErrorOutOfMemory
         const auto bytes = [](const std::vector<int64_t>& n, const std::vector<int64_t>& st) {
             int64_t b = 0;
             for (size_t c = 0; c < n.size(); ++c) b += n[c] * st[c];
@@ -911,6 +938,138 @@ int main() {
                     }
                 }
             check("warmretry.after_scaled_slots_keeps_floor", sw.ok, sw.why());
+        }
+        {   // a negative floor is no floor: a class never gets fewer than 0 slots
+            const auto r = warm_retry_slots(true, kOom, 0, {40}, {6656 * 1024}, {-3});
+            check("warmretry.negative_floor_never_gives_negative_slots", r.size() == 1 && r[0] >= 0 && r[0] < 40,
+                  r.empty() ? "empty" : std::to_string(r[0]));
+            const auto r2 = warm_retry_slots(true, kOom, 0, {40, 4000}, {6656 * 1024, 7168 * 1024}, {-3, -100});
+            check("warmretry.negative_floors_multi_class_never_negative",
+                  r2.size() == 2 && r2[0] >= 0 && r2[1] >= 0 && r2[0] <= 40 && r2[1] < 4000,
+                  r2.size() != 2 ? "empty" : std::to_string(r2[0]) + "," + std::to_string(r2[1]));
+        }
+    }
+    {   // A split's warm-ups and the re-pins of their retries (WarmGate): no re-pin while any part warms up, two parts
+        // retrying at once take turns (no deadlock), a waiting re-pin goes before a warm-up not yet begun, one part never
+        // waits.  A deadlock is a check failing on a timeout (the stuck threads are left behind, the gate leaked)
+        using strata::core::glmfast::WarmGate;
+        using Clock = std::chrono::steady_clock;
+        const auto wait_for = [](const std::atomic<int>& v, int want, int ms) {
+            const auto end = Clock::now() + std::chrono::milliseconds(ms);
+            while (v.load() != want && Clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return v.load() == want;
+        };
+        const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        {
+            auto* g = new WarmGate;
+            auto* done = new std::atomic<int>{0};
+            std::thread([g, done] {
+                for (int i = 0; i < 5; ++i) {
+                    g->begin_warm();
+                    g->end_warm();
+                    g->begin_repin();
+                    g->end_repin();
+                }
+                g->begin_warm();
+                g->end_warm();
+                done->store(1);
+            }).detach();
+            check("warmgate.one_part_never_waits", wait_for(*done, 1, 2000));
+        }
+        {
+            auto* g = new WarmGate;
+            auto* repinned = new std::atomic<int>{0};
+            g->begin_warm();   // another part warms up
+            std::thread([g, repinned] {
+                g->begin_repin();
+                repinned->store(1);
+                g->end_repin();
+            }).detach();
+            nap(100);
+            const bool waited = repinned->load() == 0;
+            g->end_warm();
+            check("warmgate.repin_waits_for_another_parts_warm", waited && wait_for(*repinned, 1, 2000),
+                  waited ? "never re-pinned" : "re-pinned during the warm-up");
+        }
+        {
+            auto* g = new WarmGate;
+            auto* warmed = new std::atomic<int>{0};
+            g->begin_repin();   // another part re-pins
+            std::thread([g, warmed] {
+                g->begin_warm();
+                warmed->store(1);
+                g->end_warm();
+            }).detach();
+            nap(100);
+            const bool waited = warmed->load() == 0;
+            g->end_repin();
+            check("warmgate.warm_waits_for_another_parts_repin", waited && wait_for(*warmed, 1, 2000),
+                  waited ? "never warmed" : "warmed during the re-pin");
+        }
+        {
+            auto* g = new WarmGate;
+            auto* seq = new std::atomic<int>{0};
+            auto* repin_at = new std::atomic<int>{-1};
+            auto* warm_at = new std::atomic<int>{-1};
+            g->begin_warm();   // part A warms up
+            std::thread([g, seq, repin_at] {   // part B's retry waits for A
+                g->begin_repin();
+                repin_at->store(seq->fetch_add(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                g->end_repin();
+            }).detach();
+            nap(50);
+            std::thread([g, seq, warm_at] {   // part C's warm-up comes after B asked
+                g->begin_warm();
+                warm_at->store(seq->fetch_add(1));
+                g->end_warm();
+            }).detach();
+            nap(50);
+            const int a_end = seq->fetch_add(1);
+            g->end_warm();
+            const bool all = wait_for(*seq, 3, 2000);
+            check("warmgate.waiting_repin_goes_before_a_new_warm",
+                  all && a_end == 0 && repin_at->load() == 1 && warm_at->load() == 2,
+                  "A's warm ended " + std::to_string(a_end) + ", repin " + std::to_string(repin_at->load()) + ", warm " +
+                      std::to_string(warm_at->load()));
+        }
+        for (int parts : {2, 3}) {   // parts warm up and retry at once, kWarmRetryMax times each
+            struct S {
+                WarmGate g;
+                std::atomic<int> warm_now{0}, repin_now{0}, overlaps{0}, done{0}, ready{0};
+            };
+            auto* s = new S;
+            for (int p = 0; p < parts; ++p)
+                std::thread([s, p, parts] {
+                    s->ready.fetch_add(1);
+                    while (s->ready.load() < parts) std::this_thread::yield();   // every part fails at once
+                    uint64_t seed = 99 + (uint64_t) p;
+                    const auto ms = [&] {
+                        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                        return (int) ((seed >> 33) % 4);
+                    };
+                    for (int t = 0; t <= strata::core::glmfast::kWarmRetryMax; ++t) {
+                        s->g.begin_warm();
+                        s->warm_now.fetch_add(1);
+                        if (s->repin_now.load() != 0) s->overlaps.fetch_add(1);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(ms()));
+                        s->warm_now.fetch_sub(1);
+                        s->g.end_warm();
+                        if (t == strata::core::glmfast::kWarmRetryMax) break;
+                        s->g.begin_repin();
+                        if (s->repin_now.fetch_add(1) != 0 || s->warm_now.load() != 0) s->overlaps.fetch_add(1);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(ms()));
+                        if (s->warm_now.load() != 0) s->overlaps.fetch_add(1);
+                        s->repin_now.fetch_sub(1);
+                        s->g.end_repin();
+                    }
+                    s->done.fetch_add(1);
+                }).detach();
+            const bool all = wait_for(s->done, parts, 10000);
+            const std::string tag = "warmgate.parts" + std::to_string(parts);
+            check((tag + "_retrying_at_once_never_deadlock").c_str(), all, std::to_string(s->done.load()) + " of " + std::to_string(parts) + " done");
+            check((tag + "_repin_never_overlaps_a_warm_or_repin").c_str(), s->overlaps.load() == 0,
+                  std::to_string(s->overlaps.load()) + " overlaps");
         }
     }
     std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
