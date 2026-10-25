@@ -372,8 +372,9 @@ public:
     glmfast::SplitSync* split_load_ = nullptr;
     bool split_stop(std::string& err);   // (a split part) stop: another part failed first - false
     // this start's RAM tier (fast_setup), for the line a start short of pinned memory ends with (glmfast::
-    // ram_tier_oom_line): the bytes it set out to pin, then pinned (-1: none planned), its size not the auto one, and
-    // whether the start failed for want of pinned memory (a refused pin, a warm-up out of memory)
+    // ram_tier_oom_line): the bytes it set out to pin, then pinned (-1: none planned), its size not the engine's own
+    // choice (glmfast::ram_tier_sizing: a staging-only tier is the engine's), and whether the start failed for want of
+    // pinned memory (a refused pin - the tier's, its small buffers' - or a warm-up out of memory)
     int64_t tier_try_b_ = -1;
     bool tier_manual_ = false;
     bool tier_oom_ = false;
