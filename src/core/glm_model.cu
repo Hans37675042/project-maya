@@ -1324,7 +1324,8 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->profile_path_ = profile_path_;   // every part reads the same profile
         m->head_half_ = i == helper;
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
-            // (the line with the tiers of the parts loaded and this one's)
+            // (the line with the tiers of the parts loaded and this one's: the sequential load's total stops at the
+            // failing part - the parts after it never started, their tiers are not in it)
             std::vector<glmfast::SplitPartEnd> ends;
             for (const Glm5Model* p = this; p != nullptr; p = p == m ? nullptr : p->split_next_.get())
                 ends.push_back({p != m, p == m ? err : std::string(), p->tier_try_b_, p->tier_manual_, p->tier_oom_});

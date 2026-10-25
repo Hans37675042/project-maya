@@ -410,6 +410,7 @@ public:
         }
         cv_.notify_all();
     }
+    // (test-only: the engine never calls it - it reads SplitSync::aborted, and a begin_ that returns false)
     bool aborted() {
         std::lock_guard<std::mutex> lk(mu_);
         return aborted_;
@@ -541,7 +542,8 @@ private:
 // (warm_oom_class) - with the RAM tiers this start set out to pin (all GPUs, GB of 2^30 bytes) and whether their size
 // was not the engine's own choice (ram_tier_sizing: STRATA_GLM_RAM_GB, the API's budget, RAM-resident).  Within one
 // process the tier cannot pin again what it gave back (Windows: ~32 GB unpinned, then not even 256 MB pinned), so
-// serve/server.py starts the engine again with a smaller STRATA_GLM_RAM_GB from it (ram_retry_gb) - manual=0 only
+// serve/server.py starts the engine again with a smaller STRATA_GLM_RAM_GB from it (ram_retry_gb): on manual=0, and
+// on manual=1 when that size was the launcher's own, set by its earlier restart (never when the user set one)
 inline std::string ram_tier_oom_line(int64_t total_bytes, bool manual) {
     char b[96];
     std::snprintf(b, sizeof b, "glm fast: RAM-TIER-OOM total_gb=%.2f manual=%d",
