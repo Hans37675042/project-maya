@@ -419,6 +419,8 @@ RAM_OOM_RE = re.compile(r"glm fast: RAM-TIER-OOM total_gb=(\d+(?:\.\d+)?) manual
 RAM_RETRY_MAX = 3          # restarts after the first start
 RAM_RETRY_FLOOR_GB = 1.0   # no restart below this
 RAM_SET_KEYS = ("MAYA_GLM_RAM_GB", "STRATA_GLM_RAM_GB")
+ENGINE_END_WAIT_S = 30.0   # a refused start's process ends within this (its output closed), or it is killed ...
+ENGINE_KILL_WAIT_S = 20.0  # ... and ends within this after the kill
 
 
 def ram_oom_of(text: str | None) -> tuple[float, bool] | None:
@@ -481,22 +483,8 @@ class StrataEngine:
             tail = self._log_since(log_start)
             nxt = ram_retry_gb(tail, env if env is not None else os.environ, ram_try, restarts)
             if nxt is None:
-                why = ""
-                if ram_try is not None:
-                    found = ram_oom_of(tail)
-                    why = (f" - {restarts} restart(s) with a smaller RAM tier, the last at STRATA_GLM_RAM_GB={ram_try:g}" +
-                           (f" ran out of pinned RAM at {found[0]:.2f} GB" if found else ""))
-                if log:
-                    self.log.close()   # (no engine writes to it any more)
-                raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") + why)
-            try:   # (its output closed: it is ending) no engine is left behind the restart
-                self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                self.proc.wait(timeout=20)
-            for pipe in (self.proc.stdin, self.proc.stdout):
-                with contextlib.suppress(OSError):
-                    pipe.close()
+                self._start_failed(log, tail, ram_try, restarts)
+            self._end_refused()
             restarts += 1
             print(f"[maya] the engine ran out of pinned RAM at {ram_oom_of(tail)[0]:.2f} GB - restarting with "
                   f"STRATA_GLM_RAM_GB={nxt:g} ({restarts} of {RAM_RETRY_MAX})", flush=True)
@@ -512,6 +500,29 @@ class StrataEngine:
         # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
         self.lines: queue.Queue = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
+
+    def _start_failed(self, log, tail: str, ram_try: float | None, restarts: int):
+        """Raise the error of a start that ended before READY and gets no restart (the log closed first)."""
+        why = ""
+        if ram_try is not None:
+            found = ram_oom_of(tail)
+            why = (f" - {restarts} restart(s) with a smaller RAM tier, the last at STRATA_GLM_RAM_GB={ram_try:g}" +
+                   (f" ran out of pinned RAM at {found[0]:.2f} GB" if found else ""))
+        if log:
+            self.log.close()   # (no engine writes to it any more)
+        raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") + why)
+
+    def _end_refused(self):
+        """A start refused for want of pinned RAM: its process is ending (its output closed) - wait for it, or end it,
+        so no engine is left behind the restart."""
+        try:
+            self.proc.wait(timeout=ENGINE_END_WAIT_S)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            with contextlib.suppress(OSError):
+                pipe.close()
 
     def _log_since(self, offset: int, most: int = 256 << 10) -> str:
         """The engine log from `offset` (this start's), its last `most` bytes at most; empty without a log."""
