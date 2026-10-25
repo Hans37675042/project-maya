@@ -1251,7 +1251,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         std::vector<std::unique_ptr<Glm5Model>> owned((size_t) n);
         std::vector<Glm5Model*> parts((size_t) n, this);
         for (int i = 1; i < n; ++i) owned[(size_t) i].reset(new Glm5Model()), parts[(size_t) i] = owned[(size_t) i].get();
-        SplitLoad sl(n);
+        glmfast::SplitSync sl(n);
         std::vector<std::string> errs((size_t) n);
         std::vector<char> ok((size_t) n, 0);
         std::vector<std::thread> th;
@@ -1268,8 +1268,9 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             p->head_half_ = i == helper;
             th.emplace_back([&, i, l0, l1, p] {
                 ok[(size_t) i] = p->load_pack(pack_dir, max_ctx, errs[(size_t) i], devs[(size_t) i], l0, l1);
-                sl.pass(i);       // (a part that stopped early, or never reached those turns, lets the others on)
-                sl.pass_pin(i);
+                // (a failure aborts the others' start; a part that stopped early, or never reached those turns, lets
+                // the others on)
+                sl.finish(i, ok[(size_t) i] != 0);
             });
         }
         for (auto& t : th) t.join();
@@ -1277,11 +1278,17 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             parts[(size_t) i]->split_load_ = nullptr;
             parts[(size_t) i]->defer_lane_ = false;
         }
-        for (int i = 0; i < n; ++i)
-            if (!ok[(size_t) i]) {
-                err = errs[(size_t) i];
-                return false;
-            }
+        // the start ends with the error of the part that failed first (the others stopped on it, or failed after it:
+        // theirs follow) - a refused pin on the second card stopped the first one's warm-up, whose out of memory used
+        // to stand for it
+        std::vector<int> failed = sl.failures();
+        for (int i = 0; i < n && failed.empty(); ++i)
+            if (!ok[(size_t) i]) failed.push_back(i);
+        if (!failed.empty()) {
+            err = errs[(size_t) failed[0]];
+            for (size_t k = 1; k < failed.size(); ++k) err += "; then " + errs[(size_t) failed[k]];
+            return false;
+        }
         for (int i = n - 1; i >= 1; --i) parts[(size_t) i - 1]->split_next_ = std::move(owned[(size_t) i]);
         if (helper > 0 && parts[(size_t) helper]->head_half_ && !parts[(size_t) n - 1]->head_split_link(parts[(size_t) helper], err)) {
             split_next_.reset();
@@ -3616,7 +3623,10 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         else if (!dflash_load(dflash_path_, dev_, err))
             return false;
     }
-    if (fast_mode_ && !fast_setup(err)) return false;
+    if (fast_mode_ && !fast_setup(err)) {
+        if (split_load_ != nullptr) split_load_->fail(part_);   // (now: the others stop before their own errors)
+        return false;
+    }
     reset();
     return true;
 }

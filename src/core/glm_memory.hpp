@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -353,12 +354,16 @@ inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int trie
 //   - a re-pin asked for goes before every warm-up not yet begun (the ones running end; none starts past it), so the
 //     re-pin is not held off by the other parts' next warm-ups
 //   - one GPU (no split) never takes the gate: its path has no wait at all
+//   - an aborted split (a part failed, SplitSync::fail): every waiter wakes without a turn, and no turn is given after -
+//     a begin_ returns false then.  A turn already held runs on and is given back as before
 class WarmGate {
 public:
-    void begin_warm() {
+    bool begin_warm() {
         std::unique_lock<std::mutex> lk(mu_);
-        cv_.wait(lk, [&] { return !repinning_ && repin_asked_ == 0; });
+        cv_.wait(lk, [&] { return aborted_ || (!repinning_ && repin_asked_ == 0); });
+        if (aborted_) return false;
         ++warming_;
+        return true;
     }
     void end_warm() {
         {
@@ -367,12 +372,14 @@ public:
         }
         cv_.notify_all();
     }
-    void begin_repin() {
+    bool begin_repin() {
         std::unique_lock<std::mutex> lk(mu_);
         ++repin_asked_;
-        cv_.wait(lk, [&] { return !repinning_ && warming_ == 0; });
+        cv_.wait(lk, [&] { return aborted_ || (!repinning_ && warming_ == 0); });
         --repin_asked_;
+        if (aborted_) return false;
         repinning_ = true;
+        return true;
     }
     void end_repin() {
         {
@@ -381,6 +388,17 @@ public:
         }
         cv_.notify_all();
     }
+    void abort() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            aborted_ = true;
+        }
+        cv_.notify_all();
+    }
+    bool aborted() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return aborted_;
+    }
 
 private:
     std::mutex mu_;
@@ -388,22 +406,100 @@ private:
     int warming_ = 0;       // the parts warming up now
     int repin_asked_ = 0;   // the parts waiting for their re-pin's turn
     bool repinning_ = false;
+    bool aborted_ = false;
 };
-// a turn of a WarmGate, given back however its scope ends (gate nullptr: none - one GPU)
+// a turn of a WarmGate, given back however its scope ends (gate nullptr: none - one GPU).  ok(): the turn was taken
+// (false: the split was aborted - nothing to give back)
 class WarmTurn {
 public:
     WarmTurn(WarmGate* gate, bool repin) : gate_(gate), repin_(repin) {
-        if (gate_ != nullptr) repin_ ? gate_->begin_repin() : gate_->begin_warm();
+        if (gate_ != nullptr) held_ = repin_ ? gate_->begin_repin() : gate_->begin_warm();
     }
     ~WarmTurn() {
-        if (gate_ != nullptr) repin_ ? gate_->end_repin() : gate_->end_warm();
+        if (gate_ != nullptr && held_) repin_ ? gate_->end_repin() : gate_->end_warm();
     }
+    bool ok() const { return gate_ == nullptr || held_; }
     WarmTurn(const WarmTurn&) = delete;
     WarmTurn& operator=(const WarmTurn&) = delete;
 
 private:
     WarmGate* gate_;
     bool repin_;
+    bool held_ = false;
+};
+
+// A parallel split load's turns (glm_model.cu's load_pack_split, fast_setup): the parts take the RAM budget in part
+// order (wait / pass), then pin their RAM tiers in part order too (wait_pin / pass_pin), and warm up under `gate`.
+// A part that fails (fail) aborts the split: every wait here and at the gate wakes and returns false, and the parts
+// still loading stop instead of warming up or retrying - a 2-GPU start whose second card's pin was refused had the
+// first card warm up, run out of memory and report that instead, and CUDA1's "did not allocate" went unseen.  A part
+// that stops because of the abort says so (stopped): failures() keeps the parts that failed of their own, the earliest
+// first.  Every part's thread ends with finish(), which passes its turns however it ended (a part that never reached
+// them lets the others on)
+class SplitSync {
+public:
+    explicit SplitSync(int n) : passed_((size_t) std::max(0, n), false), pinned_((size_t) std::max(0, n), false),
+                                stopped_((size_t) std::max(0, n), false) {}
+    int parts() const { return (int) passed_.size(); }
+    // wait for the turn of `part` (parts: all have passed); false: the split was aborted
+    bool wait(int part) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return aborted_ || turn_ >= part; });
+        return !aborted_;
+    }
+    void pass(int part) { mark(passed_, turn_, part); }
+    bool wait_pin(int part) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return aborted_ || pin_turn_ >= part; });
+        return !aborted_;
+    }
+    void pass_pin(int part) { mark(pinned_, pin_turn_, part); }
+    // `part` failed: the split is aborted (the gate first: a part that reads aborted() true finds no turn there)
+    void fail(int part) {
+        gate.abort();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            const bool own = part >= 0 && part < parts() && !stopped_[(size_t) part];
+            if (own && std::find(failed_.begin(), failed_.end(), part) == failed_.end()) failed_.push_back(part);
+            aborted_ = true;
+            aborted_flag_.store(true);
+        }
+        cv_.notify_all();
+    }
+    // `part` stops because the split was aborted: its end (finish(part, false)) is no failure of its own
+    void stopped(int part) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (part >= 0 && part < parts()) stopped_[(size_t) part] = true;
+    }
+    // a part's thread ends: a failure aborts, and its turns pass whatever it reached
+    void finish(int part, bool ok) {
+        if (!ok) fail(part);
+        pass(part);
+        pass_pin(part);
+    }
+    bool aborted() const { return aborted_flag_.load(); }
+    std::vector<int> failures() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return failed_;
+    }
+    WarmGate gate;   // the warm-ups and their retries' re-pins
+
+private:
+    void mark(std::vector<bool>& done, int& turn, int part) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (part >= 0 && part < parts()) done[(size_t) part] = true;
+            while (turn < parts() && done[(size_t) turn]) ++turn;
+        }
+        cv_.notify_all();
+    }
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<bool> passed_, pinned_, stopped_;
+    std::vector<int> failed_;   // the parts that failed of their own, in order
+    int turn_ = 0, pin_turn_ = 0;
+    bool aborted_ = false;
+    std::atomic<bool> aborted_flag_{false};   // (aborted_, read without the lock: a warm-up's poll)
 };
 
 }  // namespace strata::core::glmfast

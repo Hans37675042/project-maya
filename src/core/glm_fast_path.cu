@@ -455,8 +455,8 @@ static void numa_pinned_free(void* p, size_t bytes) {
 
 // The RAM tier's sizing pins through these: STRATA_GLM_PIN_CAP_MB=<MB> (tests) refuses what would take the bytes they
 // hold past it - a Windows pinning cap where there is none.  (A split's parts pin their first tiers one after another, in
-// part order (SplitLoad::wait_pin / pass_pin); a warm-up retry's re-pin runs alone too - no other part warms up or
-// re-pins meanwhile (g_split_warm) - but beside the other parts' threads, hence the atomic.)
+// part order (SplitSync::wait_pin / pass_pin); a warm-up retry's re-pin runs alone too - no other part warms up or
+// re-pins meanwhile (SplitSync::gate) - but beside the other parts' threads, hence the atomic.)
 static std::atomic<int64_t> g_pin_held{0};   // (atomic: a warm-up's retry pins while another part's threads run)
 static cudaError_t pin_alloc(void** p, size_t bytes, unsigned flags) {
     static const int64_t cap = getenv("STRATA_GLM_PIN_CAP_MB") ? std::atoll(getenv("STRATA_GLM_PIN_CAP_MB")) << 20 : -1;
@@ -509,9 +509,9 @@ static bool pin_capped() {
 static std::vector<int64_t> split_plan, split_small;
 static double split_scale = 1.0;
 static bool split_measured = false;
-// a parallel split's warm-ups and their retries' re-pins (glmfast::WarmGate): a re-pin waits until no other part warms
-// up or re-pins, and no part starts a warm-up while one waits or runs.  One GPU never takes it
-static glmfast::WarmGate g_split_warm;
+// (a parallel split's warm-ups and their retries' re-pins take turns at its SplitSync's gate (glmfast::WarmGate): a
+// re-pin waits until no other part warms up or re-pins, and no part starts a warm-up while one waits or runs.  One GPU
+// never takes it)
 
 
 // a start-time upload of pageable host data through a pinned buffer of ours (the disk staging): a pageable copy needs
@@ -646,6 +646,15 @@ static void* fa_take_b(uint8_t*& at, size_t bytes) {
 namespace {
 void cpu_win_alloc(Glm5Model::FastState* F, const Glm5Geometry& g, bool exl3);   // (after X3Rows)
 }  // namespace
+
+// a split part that stops because another part failed (SplitSync aborted): not a failure of its own - the start ends
+// with that part's error (glm_model.cu's load_pack_split)
+bool Glm5Model::split_stop(std::string& err) {
+    if (split_load_ != nullptr) split_load_->stopped(part_);
+    err = "glm split: CUDA" + std::to_string(dev_) + " stopped - another part of the split failed first";
+    std::fprintf(stderr, "%s\n", err.c_str());
+    return false;
+}
 
 bool Glm5Model::fast_setup(std::string& err) {
     cudaSetDevice(dev_);
@@ -1062,7 +1071,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         // a parallel split load: the parts pin their prompt paths, size their pools and plan their RAM tiers one at a
         // time, in part order - the first part's RAM measurement then sees none of the later parts' prompt staging, as
         // when they load one after another (it took that staging twice: once pinned, once in the headroom)
-        if (split_load_ != nullptr) split_load_->wait(part_);
+        if (split_load_ != nullptr && !split_load_->wait(part_)) return split_stop(err);
         // a layer's slot stride: MMQ-addressable (glmfast::expert_stride), so the prompt path multiplies the pool
         // partition in place
         const auto slot_stride = [&](int il) {
@@ -1625,13 +1634,13 @@ bool Glm5Model::fast_setup(std::string& err) {
                 split_small[(size_t) part_] = small_b;
             }
             split_load_->pass(part_);
-            split_load_->wait(n_parts_);
+            if (!split_load_->wait(n_parts_)) return split_stop(err);
             // ... and then pin one after another, in part order: near a pinning cap (Windows) parts pinning at once
             // raced for the room under it - a 2x RTX 3080 box's first part shrank to 13.1 of its planned 21.5 GB while
             // the second pinned all of its 22.5 (#105).  In turn, only the part that reaches the cap gives way - and
             // under a cap (pin_capped) every part gives way alike: each pins its plan's share of the room the first
             // part measures for all of them (below), so the last one is not left whatever the first ones did not take
-            split_load_->wait_pin(part_);
+            if (!split_load_->wait_pin(part_)) return split_stop(err);
         }
         // the small pinned buffers first - the table updates and the disk reads' staging (an expert a routed entry):
         // where the driver caps what can be pinned (Windows: an RTX 5090 Laptop with 64 GB, the cap reached at a 45.3
@@ -1758,7 +1767,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             F->ram_bytes += (size_t) n * R.stride;
         }
         if (!tier_ok) {
-            err = "glm fast: the pinned RAM tier did not allocate";
+            err = "glm fast: CUDA" + std::to_string(dev_) + " the pinned RAM tier did not allocate";
             return false;
         }
         // (an APU whose pool holds every expert keeps a staging-only tier: no expert is outside VRAM to hold)
@@ -1774,7 +1783,8 @@ bool Glm5Model::fast_setup(std::string& err) {
         // of a split met the cap, freed its refused class and measured the room while the first card streamed its
         // experts in - it found 0.00 GB to pin (where 13 GB pinned on the same PC without that refusal) and the start
         // failed.  The parts then pin, measure and free with every card idle, as one GPU does
-        if (split_load_ != nullptr && capped) split_load_->wait_pin(n_parts_);
+        // (a part that failed before - its pin refused - stops this start: no warm-up, no retry)
+        if (split_load_ != nullptr && capped && !split_load_->wait_pin(n_parts_)) return split_stop(err);
         if (split_load_ == nullptr && !staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
             remaining_layers -= n_moe;
@@ -1851,11 +1861,12 @@ bool Glm5Model::fast_setup(std::string& err) {
         // gives some slots back, up to kWarmRetryMax times, and the warm-up runs again (glmfast::warm_retry_slots).  A
         // size set by hand (STRATA_GLM_RAM_GB, the API's budget) fails with the error, as before.
         const bool tier_auto = !staging_only && !fixed_ram && ram_budget_ < 0 && !F->ram_resident;
-        // A split's parts warm up at once: a retry's re-pin takes g_split_warm's exclusive turn - no other part warms up
-        // or re-pins meanwhile (the room under a cap read while a card streams its experts in is 0.00 GB, the reason for
-        // wait_pin above, and a re-pin there can take the pinned buffers another card's copy needs).  One GPU takes no
-        // turn and never waits
-        glmfast::WarmGate* const gate = split_load_ != nullptr && n_parts_ > 1 ? &g_split_warm : nullptr;
+        // A split's parts warm up at once: a retry's re-pin takes the split's gate's exclusive turn - no other part warms
+        // up or re-pins meanwhile (the room under a cap read while a card streams its experts in is 0.00 GB, the reason
+        // for wait_pin above, and a re-pin there can take the pinned buffers another card's copy needs).  One GPU takes
+        // no turn and never waits.  An aborted split (another part failed) gives no turn: this part stops - a retry
+        // runs only while every part has pinned and none failed
+        glmfast::WarmGate* const gate = split_load_ != nullptr && n_parts_ > 1 ? &split_load_->gate : nullptr;
         // a retry's re-pin (`retry`: its number): the old arenas go first, then the smaller tier pins with the first
         // pin's steps (glmfast::pin_tier_classes, guarded: each class leaves the floors of the classes after it pinnable;
         // at a refusal the room is measured, not stepped down blind).  The other parts' tiers and buffers are pinned
@@ -1937,9 +1948,12 @@ bool Glm5Model::fast_setup(std::string& err) {
             bool warmed;
             {
                 glmfast::WarmTurn turn(gate, false);   // (a split: no part re-pins while this warm-up runs)
+                if (!turn.ok()) return split_stop(err);
                 warmed = fast_warm(err);
             }
             if (warmed) break;
+            // another part failed meanwhile: this warm-up's own error (or its stop) ends the start, no retry
+            if (split_load_ != nullptr && split_load_->aborted()) return false;
             std::vector<int64_t> have(n_cls), strd(n_cls);
             int64_t was = 0, now = 0;
             for (size_t c = 0; c < n_cls; ++c) {
@@ -1966,10 +1980,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                          dev_, (double) was / 1073741824.0, (double) now / 1073741824.0, retries + 1, glmfast::kWarmRetryMax);
             // (under a cap every part passed wait_pin before its first warm-up: no wait.  Without one a later part may
             // still pin its first tier - it never waits on this part there, so this wait ends)
-            if (gate != nullptr) split_load_->wait_pin(n_parts_);
+            if (gate != nullptr && !split_load_->wait_pin(n_parts_)) return split_stop(err);
             bool repinned;
             {
                 glmfast::WarmTurn turn(gate, true);   // no other part warms up or re-pins meanwhile
+                if (!turn.ok()) return split_stop(err);
                 repinned = retier(to, retries + 1);
             }
             if (!repinned) return false;
@@ -3770,6 +3785,8 @@ bool Glm5Model::fast_warm(std::string& err) {
     for (const auto& j : jobs) total_bytes += F->L[(size_t) j.il].blob;
     int last_pct = -1;
     for (size_t b = 0; b < jobs.size(); b += 8) {
+        // a split whose other part failed: this warm-up stops (its start ends with that part's error)
+        if (split_load_ != nullptr && split_load_->aborted()) return split_stop(err);
         const int nb = (int) std::min<size_t>(8, jobs.size() - b);
         F->workers->run(nb * 3, [&](int job) {
             const Job& J = jobs[b + (size_t) (job / 3)];

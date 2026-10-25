@@ -49,6 +49,7 @@ namespace strata::core {
 
 namespace glmfast {
 class Workers;
+class SplitSync;
 }  // namespace glmfast
 
 /// One served weight: F32 (dequantized at load) or a ggml-quantized row tensor uploaded RAW to
@@ -366,39 +367,10 @@ public:
     std::vector<int> split_devs_;                          // ... and the CUDA devices of all of them, part by part
     std::unique_ptr<Glm5Model> split_next_;
     // parallel split load: parts take the RAM budget in part order, then pin their RAM tiers in part order too
-    // (wait_pin / pass_pin); CPU lane setup waits until all have loaded
-    struct SplitLoad {
-        std::mutex mu;
-        std::condition_variable cv;
-        std::vector<bool> passed, pinned;
-        int turn = 0, pin_turn = 0;
-        explicit SplitLoad(int n) : passed((size_t) n, false), pinned((size_t) n, false) {}
-        void wait(int part) {
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return turn >= part; });
-        }
-        void pass(int part) {
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                passed[(size_t) part] = true;
-                while (turn < (int) passed.size() && passed[(size_t) turn]) ++turn;
-            }
-            cv.notify_all();
-        }
-        void wait_pin(int part) {
-            std::unique_lock<std::mutex> lk(mu);
-            cv.wait(lk, [&] { return pin_turn >= part; });
-        }
-        void pass_pin(int part) {
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                pinned[(size_t) part] = true;
-                while (pin_turn < (int) pinned.size() && pinned[(size_t) pin_turn]) ++pin_turn;
-            }
-            cv.notify_all();
-        }
-    };
-    SplitLoad* split_load_ = nullptr;
+    // (glmfast::SplitSync: wait / pass, wait_pin / pass_pin), and a part that fails aborts the others' start; CPU lane
+    // setup waits until all have loaded
+    glmfast::SplitSync* split_load_ = nullptr;
+    bool split_stop(std::string& err);   // (a split part) stop: another part failed first - false
     bool defer_lane_ = false;
     std::vector<float> hop_;                               // the boundary residual staging buffer
     int* d_tok_ = nullptr;                                 // the sampler's one-int output, on dev_
