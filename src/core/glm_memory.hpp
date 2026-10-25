@@ -517,6 +517,26 @@ private:
     std::atomic<bool> aborted_flag_{false};   // (aborted_, read without the lock: a warm-up's poll)
 };
 
+// A split part's load (load_pack) that ends anywhere but its success aborts the split there and then (SplitSync::fail):
+// a part failing before its RAM tier (the VRAM pool, the drafter, a file read, the sampler buffer) used to say so only
+// when its thread ended, and the other parts loaded all their weights first.  They now stop at their next turn or
+// phase boundary.  dismiss(): the load succeeded.  nullptr: one GPU or the sequential split - nothing to abort.  A part
+// that stopped on another's abort (SplitSync::stopped) is not recorded as failed
+class SplitFailOnExit {
+public:
+    SplitFailOnExit(SplitSync* s, int part) : s_(s), part_(part) {}
+    ~SplitFailOnExit() {
+        if (s_ != nullptr) s_->fail(part_);
+    }
+    void dismiss() { s_ = nullptr; }
+    SplitFailOnExit(const SplitFailOnExit&) = delete;
+    SplitFailOnExit& operator=(const SplitFailOnExit&) = delete;
+
+private:
+    SplitSync* s_;
+    int part_;
+};
+
 // The start's line when it failed for want of pinned memory - a RAM tier's pin refused, or a warm-up out of memory
 // (warm_oom_class) - with the RAM tiers this start set out to pin (all GPUs, GB of 2^30 bytes) and whether their size
 // was not the engine's own choice (ram_tier_sizing: STRATA_GLM_RAM_GB, the API's budget, RAM-resident).  Within one

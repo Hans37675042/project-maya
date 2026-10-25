@@ -2832,6 +2832,10 @@ void strata::core::Glm5Model::pack_release_views() {
 
 bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_ctx, std::string& err, int dev,
                                         int l0, int l1) {
+    // a parallel split: a failure anywhere below aborts the other parts' start at once (glmfast::SplitFailOnExit), and
+    // this part stops at its next phase when another part failed (split_aborted: split_stop - not a failure of its own)
+    glmfast::SplitFailOnExit fail_on_exit(split_load_, part_);
+    const auto split_aborted = [&] { return split_load_ != nullptr && split_load_->aborted(); };
     dev_ = dev;
     pack_dir_ = pack_dir;
     cudaSetDevice(dev_);
@@ -2888,6 +2892,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         return -1;
     };
 
+    if (split_aborted()) return split_stop(err);
     // 3. native_experts.txt: per MoE layer, the expert types and blob offsets
     pack_layers_.assign((size_t) g_.n_layers, NativeLayer{});
     {
@@ -3009,6 +3014,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
 
+    if (split_aborted()) return split_stop(err);
     // 4. the dense tensors: dequantize everything into the F32 device arena.  F32 rows come
     //    straight out of dense.bin; every other kind (BF16 rows and the natively-served
     //    quantized rows) is resolved through the GGUF shards and dequantized by ggml's traits.
@@ -3333,6 +3339,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                              "reads both halves at once\n", dev_, c0, m.n, (double) (run_b * (m.k / 16)) / 1048576.0);
     }
 
+    if (split_aborted()) return split_stop(err);
     // 4b. the NextN (MTP) block on the LAST half of the fast path: its own weights from the shards (the pack never
     //     carried blk.<n_layers>.*), its experts through the tiers like any MoE layer
     lt_ = l1_;
@@ -3370,6 +3377,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         if (mtp_il_ >= 0 && mtp_one) mtp_vocab_scan(gfs);   // the draft head's vocabulary
     }
 
+    if (split_aborted()) return split_stop(err);
     // 5. the router bias, host-side: the prefetch ranks the next-best experts per layer, and the
     //    ranking needs sigmoid(logits) + this per-layer bias (device-side it stays as it was)
     host_probs_b_.assign((size_t) g_.n_layers * g_.n_expert, 0.0f);
@@ -3380,6 +3388,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                        (size_t) g_.n_expert * sizeof(float), cudaMemcpyDeviceToHost);
     }
 
+    if (split_aborted()) return split_stop(err);
     // 6. the state and scratch arenas (identical to load()), then the CPU MoE buffers
     const int64_t hc_dim = (int64_t) g_.hc * g_.n_embd;
     const int64_t max_pools = max_ctx / g_.idx_kpool;
@@ -3501,6 +3510,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
 
+    if (split_aborted()) return split_stop(err);
     // 6. the device expert pool (M2b): uniform slots sized for the largest per-layer blob, filled
     //    on miss straight from the mmap'd shards, LRU residency.  The grouped kernels read a
     //    host-mapped plan (UVA), so a token needs no plan copies.  STRATA_GLM_CPU_EXPERTS forces
@@ -3625,6 +3635,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     pack_ = true;
     loaded_ = true;
     if (fast_mode_) pack_release_views();   // before fast_setup: its RAM tier sees the embedding's heap copy
+    if (split_aborted()) return split_stop(err);
     // a DFlash drafter on the part with the head: its weights and ring before the expert pool is sized
     dflash_on_ = fast_mode_ && !dflash_path_.empty();
     if (!dflash_path_.empty() && l1_ == g_.n_layers) {
@@ -3633,12 +3644,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         else if (!dflash_load(dflash_path_, dev_, err))
             return false;
     }
+    if (split_aborted()) return split_stop(err);
     if (fast_mode_ && !fast_setup(err)) {
-        if (split_load_ != nullptr) split_load_->fail(part_);   // (now: the others stop before their own errors)
-        else if (n_parts_ <= 1 && tier_oom_) tier_oom_report(tier_try_b_, tier_manual_);   // (a split's: its load)
+        // (a parallel split's part: fail_on_exit aborts the others now, before their own errors; a split's line: its load)
+        if (split_load_ == nullptr && n_parts_ <= 1 && tier_oom_) tier_oom_report(tier_try_b_, tier_manual_);
         return false;
     }
     reset();
+    fail_on_exit.dismiss();
     return true;
 }
 
