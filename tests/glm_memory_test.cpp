@@ -1507,6 +1507,25 @@ int main() {
             check("oomline.gap.reads_back", sw.ok, sw.why());
         }
     }
+    {   // how a part's RAM tier was sized: manual (the RAM-TIER-OOM line's manual=1) only for a size not the engine's own
+        // choice; a staging-only tier the engine chose itself is not manual, and it never shrinks in-engine either
+        using strata::core::glmfast::ram_tier_sizing;
+        const auto flags = [](strata::core::glmfast::RamTierSizing s) {
+            return std::string("manual=") + (s.manual ? "1" : "0") + " auto=" + (s.auto_sized ? "1" : "0");
+        };
+        const auto st = ram_tier_sizing(true, false, false, false);
+        check("tiersizing.staging_only_is_not_manual", !st.manual && !st.auto_sized, flags(st));
+        const auto au = ram_tier_sizing(false, false, false, false);
+        check("tiersizing.engine_sized_is_auto", !au.manual && au.auto_sized, flags(au));
+        bool each = true;
+        std::string why;
+        for (int k = 0; k < 3; ++k)
+            for (const bool staging : {false, true}) {
+                const auto s = ram_tier_sizing(staging, k == 0, k == 1, k == 2);
+                if (!s.manual || s.auto_sized) each = false, why += flags(s) + " ";
+            }
+        check("tiersizing.user_size_budget_or_resident_is_manual", each, why);
+    }
     std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
     if (g_bad) return 1;
     std::puts("GLM memory policy checks passed (CPU only)");
