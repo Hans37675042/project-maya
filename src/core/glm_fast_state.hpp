@@ -641,6 +641,7 @@ struct Glm5Model::FastState {
     int rows_group = 0;                        // a group's rows at most (0: grouping off)
     std::vector<uint8_t*> stage;   // pinned: disk reads when no RAM slot is free
     size_t stage_bytes = 0;        // ... each (an expert's blob); the start's uploads go through stage[0] too
+    int warm_cuda_err = 0;         // the CUDA error that stopped the last fast_warm (0: none, or not a CUDA call)
     std::mutex mu;   // the service thread vs the between-token boundary
     std::unique_ptr<glmfast::Workers> workers;   // parallel disk reads
     // ---- the CPU LANE (STRATA_GLM_CPU_LANE=<threads>, 0 off): a route's RAM-tier experts split between the device's

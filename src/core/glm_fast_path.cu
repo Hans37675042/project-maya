@@ -3447,6 +3447,16 @@ bool Glm5Model::fast_warm(std::string& err) {
     const Glm5Geometry& g = g_;
     const auto t0 = std::chrono::steady_clock::now();
     const int NL = g.n_layers + 1;
+    F->warm_cuda_err = 0;
+    // a failed CUDA call stops the warm-up at once, named (a copy's error used to go unseen until the tables' upload
+    // found it, and the start said only "out of memory"); the code stays in warm_cuda_err for the caller
+    const auto cuda_fail = [&](const char* what, cudaError_t e) {
+        F->warm_cuda_err = (int) e;
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "glm fast: CUDA%d warm-up: %s failed (%s)\n", dev_, what, cudaGetErrorString(e));
+        err = std::string("glm fast: ") + what + " failed (" + cudaGetErrorString(e) + ")";
+        return false;
+    };
     std::vector<std::vector<int>> order((size_t) NL);
     for (const auto& [il, e] : profile_)
         if (il >= 0 && il < NL && e >= 0 && e < g.n_expert) order[(size_t) il].push_back(e);
@@ -3640,13 +3650,18 @@ bool Glm5Model::fast_warm(std::string& err) {
             uint8_t* d = base + (role == 0 ? 0 : role == 1 ? Ly.gu_bytes : 2 * Ly.gu_bytes);
             read_slice(sh, off, len, d);
         });
+        cudaError_t copy_err = cudaSuccess;
         for (int k = 0; k < nb; ++k) {
             const Job& J = jobs[b + (size_t) k];
-            if (J.vram)
-                cudaMemcpyAsync(J.dst, F->stage[(size_t) k], F->L[(size_t) J.il].blob, cudaMemcpyHostToDevice, F->copy);
+            if (J.vram) {
+                const cudaError_t e = cudaMemcpyAsync(J.dst, F->stage[(size_t) k], F->L[(size_t) J.il].blob,
+                                                      cudaMemcpyHostToDevice, F->copy);
+                if (copy_err == cudaSuccess) copy_err = e;
+            }
             done_bytes += F->L[(size_t) J.il].blob;
         }
-        cudaStreamSynchronize(F->copy);
+        if (const cudaError_t se = cudaStreamSynchronize(F->copy); copy_err == cudaSuccess) copy_err = se;
+        if (copy_err != cudaSuccess) return cuda_fail("a warmed expert's copy to the card", copy_err);
         const int pct = (int) (100.0 * (double) done_bytes / (double) std::max<size_t>(1, total_bytes));
         if (pct / 10 != last_pct / 10) {
             last_pct = pct;
@@ -3658,6 +3673,7 @@ bool Glm5Model::fast_warm(std::string& err) {
     if (const cudaError_t ue = upload_staged(F->stage.empty() ? nullptr : F->stage[0], F->stage_bytes, F->tab, th.data(),
                                              th.size() * sizeof(unsigned long long));
         ue != cudaSuccess) {
+        cuda_fail("the warmed expert tables' upload", ue);
         err = std::string("glm fast: the warmed expert tables did not upload (") + cudaGetErrorString(ue) + ")";
         return false;
     }
