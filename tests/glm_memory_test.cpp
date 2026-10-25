@@ -11,7 +11,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -1502,6 +1504,31 @@ int main() {
             WarmTurn b(&g, false);
             check("warmgate.gap.two_warms_share_without_abort", a.ok() && b.ok() && !g.aborted());
         }
+    }
+    {   // the golden samples the launcher's parser reads too (tests/ram_tier_oom_golden.txt; serve/test_launch_retry.py):
+        // a format change on one side alone fails a test
+        using strata::core::glmfast::ram_tier_oom_line;
+        std::string dir = __FILE__;
+        const size_t cut = dir.find_last_of("/\\");
+        dir = cut == std::string::npos ? "." : dir.substr(0, cut);
+        std::ifstream f(dir + "/ram_tier_oom_golden.txt");
+        Sweep sw;
+        int rows = 0;
+        for (std::string row; std::getline(f, row);) {
+            if (!row.empty() && row.back() == '\r') row.pop_back();
+            if (row.empty() || row[0] == '#') continue;
+            std::istringstream in(row);
+            std::string bytes, manual, gb, line;
+            std::getline(in, bytes, '\t');
+            std::getline(in, manual, '\t');
+            std::getline(in, gb, '\t');
+            std::getline(in, line);
+            const std::string got = ram_tier_oom_line(std::stoll(bytes), manual == "1");
+            sw.expect(got == line, row + " -> " + got);
+            ++rows;
+        }
+        check("oomline.golden_samples", rows >= 5 && sw.ok,   // (no file, or too few rows: a failure too)
+              rows < 5 ? dir + "/ram_tier_oom_golden.txt: " + std::to_string(rows) + " rows" : sw.why());
     }
     {   // the start's line, further: units, rounding and the reading side's shape
         using strata::core::glmfast::ram_tier_oom_line;

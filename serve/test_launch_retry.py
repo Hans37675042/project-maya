@@ -22,6 +22,11 @@ from serve import server  # noqa: E402
 from serve.server import RAM_RETRY_MAX, StrataEngine, ram_oom_of, ram_retry_gb  # noqa: E402
 
 
+# the format both sides share: tests/glm_memory_test.cpp checks the engine prints these lines, this file that the
+# launcher reads them back - a change on one side alone fails one of them
+GOLDEN = Path(__file__).resolve().parents[1] / "tests" / "ram_tier_oom_golden.txt"
+
+
 def oom(total: float, manual: int = 0) -> str:
     return f"glm fast: CUDA1 RAM tier ...\nglm fast: RAM-TIER-OOM total_gb={total:.2f} manual={manual}\nerror: ...\n"
 
@@ -38,6 +43,12 @@ class OomLine(unittest.TestCase):
 
     def test_the_last_line_wins(self):   # (a log the engine appends to: an older start's line above)
         self.assertEqual(ram_oom_of(oom(44.0) + oom(42.71)), (42.71, False))
+
+    def test_golden_samples(self):
+        rows = [r.split("\t") for r in GOLDEN.read_text(encoding="utf-8").splitlines() if r and not r.startswith("#")]
+        self.assertGreaterEqual(len(rows), 5)
+        for _bytes, manual, gb, line in rows:
+            self.assertEqual(ram_oom_of(line), (float(gb), manual == "1"), line)
 
     def test_garbled_line_is_none(self):
         self.assertIsNone(ram_oom_of("glm fast: RAM-TIER-OOM total_gb=abc manual=0\n"))
