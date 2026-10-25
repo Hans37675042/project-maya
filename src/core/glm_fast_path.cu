@@ -1856,11 +1856,11 @@ bool Glm5Model::fast_setup(std::string& err) {
         // wait_pin above, and a re-pin there can take the pinned buffers another card's copy needs).  One GPU takes no
         // turn and never waits
         glmfast::WarmGate* const gate = split_load_ != nullptr && n_parts_ > 1 ? &g_split_warm : nullptr;
-        // a retry's re-pin: the old arenas go first, then the smaller tier pins with the first
+        // a retry's re-pin (`retry`: its number): the old arenas go first, then the smaller tier pins with the first
         // pin's steps (glmfast::pin_tier_classes, guarded: each class leaves the floors of the classes after it pinnable;
         // at a refusal the room is measured, not stepped down blind).  The other parts' tiers and buffers are pinned
         // already - no later parts - and the room kept above the tiers stays
-        const auto retier = [&](const std::vector<int64_t>& to) {
+        const auto retier = [&](const std::vector<int64_t>& to, int retry) {
             for (size_t c = 0; c < n_cls; ++c) {
                 auto& R = F->rc[c];
                 unpin(c, R.n);
@@ -1897,8 +1897,10 @@ bool Glm5Model::fast_setup(std::string& err) {
             if (!ok) {
                 size_t c = 0;   // the class refused even at its floor
                 while (c < n_cls && cls_p[c] != nullptr) ++c;
-                err = "glm fast: the pinned RAM tier did not allocate again after the warm-up ran out of memory (class " +
-                      std::to_string(c) + ")";
+                err = "glm fast: CUDA" + std::to_string(dev_) + " the pinned RAM tier did not allocate again after the "
+                      "warm-up ran out of memory: cudaHostAlloc refused class " + std::to_string(c) + " at its floor of " +
+                      std::to_string(c < n_cls ? c_least[c] : 0) + " slots (RAM tier retry " + std::to_string(retry) +
+                      " of " + std::to_string(glmfast::kWarmRetryMax) + ")";
                 return false;
             }
             if ((int64_t) F->ram_bytes < target)
@@ -1946,7 +1948,19 @@ bool Glm5Model::fast_setup(std::string& err) {
                 was += have[c] * strd[c];
             }
             const std::vector<int64_t> to = glmfast::warm_retry_slots(tier_auto, F->warm_cuda_err, retries, have, strd, c_least);
-            if (to.empty()) return false;
+            if (to.empty()) {
+                // the start ends with the warm-up's error: why no (further) retry ran goes with it
+                if (!tier_auto)
+                    err += fixed_ram || ram_budget_ >= 0 ? " (manual RAM size, no retry)"
+                           : F->ram_resident        ? " (RAM-resident tier, no retry)"
+                                                    : " (staging-only RAM tier, no retry)";
+                else if (!glmfast::warm_oom_class(F->warm_cuda_err))
+                    err += " (not out of memory, no retry)";
+                else
+                    err += " after " + std::to_string(retries) + " of " + std::to_string(glmfast::kWarmRetryMax) +
+                           " RAM tier retries" + (retries < glmfast::kWarmRetryMax ? " (the RAM tier at its floors)" : "");
+                return false;
+            }
             for (size_t c = 0; c < n_cls; ++c) now += to[c] * strd[c];
             std::fprintf(stderr, "glm fast: CUDA%d warm-up out of memory - RAM tier %.2f -> %.2f GB, retrying (%d of %d)\n",
                          dev_, (double) was / 1073741824.0, (double) now / 1073741824.0, retries + 1, glmfast::kWarmRetryMax);
@@ -1956,7 +1970,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             bool repinned;
             {
                 glmfast::WarmTurn turn(gate, true);   // no other part warms up or re-pins meanwhile
-                repinned = retier(to);
+                repinned = retier(to, retries + 1);
             }
             if (!repinned) return false;
             ++retries;
@@ -3573,11 +3587,13 @@ bool Glm5Model::fast_warm(std::string& err) {
     F->warm_cuda_err = 0;
     // a failed CUDA call stops the warm-up at once, named (a copy's error used to go unseen until the tables' upload
     // found it, and the start said only "out of memory"); the code stays in warm_cuda_err for the caller
-    const auto cuda_fail = [&](const char* what, cudaError_t e) {
+    // (the error names the card and the call: a split's start ends with a part's error as it is - glm_model.cu's load)
+    const auto cuda_fail = [&](const char* what, const char* call, cudaError_t e) {
         F->warm_cuda_err = (int) e;
         (void) cudaGetLastError();
-        std::fprintf(stderr, "glm fast: CUDA%d warm-up: %s failed (%s)\n", dev_, what, cudaGetErrorString(e));
-        err = std::string("glm fast: ") + what + " failed (" + cudaGetErrorString(e) + ")";
+        std::fprintf(stderr, "glm fast: CUDA%d warm-up: %s: %s failed (%s)\n", dev_, what, call, cudaGetErrorString(e));
+        err = "glm fast: CUDA" + std::to_string(dev_) + " warm-up: " + what + ": " + call + " failed (" +
+              cudaGetErrorString(e) + ")";
         return false;
     };
     std::vector<std::vector<int>> order((size_t) NL);
@@ -3774,6 +3790,7 @@ bool Glm5Model::fast_warm(std::string& err) {
             read_slice(sh, off, len, d);
         });
         cudaError_t copy_err = cudaSuccess;
+        const char* copy_call = "cudaMemcpyAsync";   // the call copy_err came from
         for (int k = 0; k < nb; ++k) {
             const Job& J = jobs[b + (size_t) k];
             if (J.vram) {
@@ -3783,8 +3800,11 @@ bool Glm5Model::fast_warm(std::string& err) {
             }
             done_bytes += F->L[(size_t) J.il].blob;
         }
-        if (const cudaError_t se = cudaStreamSynchronize(F->copy); copy_err == cudaSuccess) copy_err = se;
-        if (copy_err != cudaSuccess) return cuda_fail("a warmed expert's copy to the card", copy_err);
+        if (const cudaError_t se = cudaStreamSynchronize(F->copy); copy_err == cudaSuccess && se != cudaSuccess) {
+            copy_err = se;
+            copy_call = "cudaStreamSynchronize";
+        }
+        if (copy_err != cudaSuccess) return cuda_fail("a warmed expert's copy to the card", copy_call, copy_err);
         const int pct = (int) (100.0 * (double) done_bytes / (double) std::max<size_t>(1, total_bytes));
         if (pct / 10 != last_pct / 10) {
             last_pct = pct;
@@ -3795,11 +3815,8 @@ bool Glm5Model::fast_warm(std::string& err) {
     }
     if (const cudaError_t ue = upload_staged(F->stage.empty() ? nullptr : F->stage[0], F->stage_bytes, F->tab, th.data(),
                                              th.size() * sizeof(unsigned long long));
-        ue != cudaSuccess) {
-        cuda_fail("the warmed expert tables' upload", ue);
-        err = std::string("glm fast: the warmed expert tables did not upload (") + cudaGetErrorString(ue) + ")";
-        return false;
-    }
+        ue != cudaSuccess)   // ("did not upload": the words this error always had)
+        return cuda_fail("the warmed expert tables did not upload", "cudaMemcpy (upload_staged)", ue);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::fprintf(stderr, "glm fast: CUDA%d tiers warm: %zu experts (%.1f GB) in %.0f s (%.2f GB/s)\n", dev_, jobs.size(),
                  (double) total_bytes / 1e9, s, (double) total_bytes / 1e9 / std::max(1e-9, s));
