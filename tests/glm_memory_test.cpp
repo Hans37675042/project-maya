@@ -1071,6 +1071,229 @@ int main() {
             check((tag + "_repin_never_overlaps_a_warm_or_repin").c_str(), s->overlaps.load() == 0,
                   std::to_string(s->overlaps.load()) + " overlaps");
         }
+        // an aborted split (a part failed): every waiter of the gate wakes and takes no turn, later turns are refused
+        {
+            auto* g = new WarmGate;
+            auto* r = new std::atomic<int>{-1};
+            g->begin_warm();   // another part warms up: the re-pin waits
+            std::thread([g, r] { r->store(g->begin_repin() ? 1 : 0); }).detach();
+            nap(50);
+            const bool waited = r->load() == -1;
+            g->abort();
+            check("warmgate.abort_wakes_a_waiting_repin", waited && wait_for(*r, 0, 2000),
+                  waited ? "still waiting or took the turn: " + std::to_string(r->load()) : "did not wait");
+            g->end_warm();
+        }
+        {
+            auto* g = new WarmGate;
+            auto* r = new std::atomic<int>{-1};
+            g->begin_repin();   // another part re-pins: the warm-up waits
+            std::thread([g, r] { r->store(g->begin_warm() ? 1 : 0); }).detach();
+            nap(50);
+            const bool waited = r->load() == -1;
+            g->abort();
+            check("warmgate.abort_wakes_a_waiting_warm", waited && wait_for(*r, 0, 2000),
+                  waited ? "still waiting or took the turn: " + std::to_string(r->load()) : "did not wait");
+            g->end_repin();
+        }
+        {
+            WarmGate g;
+            g.abort();
+            bool turn_ok = true;
+            {
+                strata::core::glmfast::WarmTurn t(&g, false);
+                turn_ok = t.ok();
+            }
+            strata::core::glmfast::WarmTurn none(nullptr, true);   // one GPU: no gate, always its turn
+            check("warmgate.after_abort_no_turn", !g.begin_warm() && !g.begin_repin() && !turn_ok && none.ok() &&
+                                                      g.aborted());
+        }
+    }
+    {   // A parallel split's turns (SplitSync): the plans and the pins in part order, and an abort when a part fails -
+        // every wait wakes and says so, the failures are kept in the order they came (a part stopped by the abort is no
+        // failure of its own), and the warm gate is aborted with it
+        using strata::core::glmfast::SplitSync;
+        using Clock = std::chrono::steady_clock;
+        const auto wait_for = [](const std::atomic<int>& v, int want, int ms) {
+            const auto end = Clock::now() + std::chrono::milliseconds(ms);
+            while (v.load() != want && Clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return v.load() == want;
+        };
+        const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        {
+            SplitSync s(2);
+            bool ok = s.wait(0) && s.wait_pin(0);
+            s.pass(0);
+            ok = ok && s.wait(1);
+            s.pass_pin(0);
+            ok = ok && s.wait_pin(1);
+            s.finish(1, true);
+            ok = ok && s.wait(2) && s.wait_pin(2);
+            check("splitsync.turns_in_order_without_abort", ok && !s.aborted() && s.failures().empty() &&
+                                                                 !s.gate.aborted());
+        }
+        {
+            auto* s = new SplitSync(2);
+            auto* r = new std::atomic<int>{-1};
+            std::thread([s, r] { r->store(s->wait(1) ? 1 : 0); }).detach();   // part 1 waits for part 0's plan
+            nap(50);
+            const bool waited = r->load() == -1;
+            s->fail(0);
+            check("splitsync.abort_wakes_wait", waited && wait_for(*r, 0, 2000), std::to_string(r->load()));
+        }
+        {
+            auto* s = new SplitSync(2);
+            auto* r = new std::atomic<int>{-1};
+            s->pass_pin(0);
+            std::thread([s, r] { r->store(s->wait_pin(2) ? 1 : 0); }).detach();   // part 0 waits for every pin
+            nap(50);
+            const bool waited = r->load() == -1;
+            s->fail(1);   // part 1's pin was refused
+            check("splitsync.abort_wakes_wait_pin", waited && wait_for(*r, 0, 2000), std::to_string(r->load()));
+        }
+        {
+            SplitSync s(3);
+            s.finish(0, true);
+            s.fail(2);
+            check("splitsync.after_abort_every_wait_says_so", !s.wait(0) && !s.wait(1) && !s.wait_pin(0) &&
+                                                                  !s.wait_pin(3) && s.aborted() && s.gate.aborted());
+        }
+        {
+            SplitSync s(3);
+            s.fail(1);       // part 1 fails first
+            s.stopped(0);    // part 0 stops on the abort ...
+            s.finish(0, false);   // ... and ends failed: not a failure of its own
+            s.fail(2);       // part 2 failed of its own, later
+            s.fail(1);       // (twice: once)
+            s.finish(1, false);
+            s.finish(2, false);
+            const std::vector<int> f = s.failures();
+            check("splitsync.failures_in_order_without_stopped_parts", f == std::vector<int>({1, 2}),
+                  f.empty() ? "none" : std::to_string(f[0]) + (f.size() > 1 ? "," + std::to_string(f[1]) : ""));
+        }
+        {
+            SplitSync s(2);
+            s.stopped(1);   // (a stop without an abort: none - the record keeps it, nothing else)
+            s.fail(0);
+            check("splitsync.first_failure_is_the_first_reported", s.failures() == std::vector<int>({0}));
+        }
+        // the 2-GPU start that hid its cause: part 0 pins its tier, part 1's pin is refused.  Part 0 waits for every pin
+        // before its warm-up (a pinning cap) and must stop there, never warm up; the failure kept is part 1's
+        {
+            Sweep sw;
+            for (int round = 0; round < 50; ++round) {
+                struct St {
+                    SplitSync s{2};
+                    std::atomic<int> warmed{0}, done{0}, stopped{0};
+                };
+                auto* st = new St;
+                std::thread([st] {   // part 0
+                    bool ok = st->s.wait(0);
+                    st->s.pass(0);
+                    ok = ok && st->s.wait(2) && st->s.wait_pin(0);
+                    if (ok) st->s.pass_pin(0);
+                    ok = ok && st->s.wait_pin(2);
+                    if (ok) {
+                        strata::core::glmfast::WarmTurn t(&st->s.gate, false);
+                        if (t.ok()) st->warmed.fetch_add(1);
+                    } else {
+                        st->s.stopped(0);
+                        st->stopped.fetch_add(1);
+                    }
+                    st->s.finish(0, ok);
+                    st->done.fetch_add(1);
+                }).detach();
+                std::thread([st, round] {   // part 1
+                    bool ok = st->s.wait(1);
+                    st->s.pass(1);
+                    ok = ok && st->s.wait(2) && st->s.wait_pin(1);
+                    if (round % 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    st->s.finish(1, false);   // the pin refused (the wrapper passes its pin turn)
+                    st->done.fetch_add(1);
+                }).detach();
+                const bool all = wait_for(st->done, 2, 5000);
+                sw.expect(all && st->warmed.load() == 0 && st->stopped.load() == 1 &&
+                              st->s.failures() == std::vector<int>({1}),
+                          "round " + std::to_string(round) + ": done " + std::to_string(st->done.load()) + ", warmed " +
+                              std::to_string(st->warmed.load()) + ", stopped " + std::to_string(st->stopped.load()));
+                if (!all) break;
+            }
+            check("splitsync.pin_refused_on_part1_stops_part0_before_its_warm", sw.ok, sw.why());
+        }
+        // 2-4 parts, one part fails at one of its steps (before its plan, its pin, its warm-up, or after a warm-up), the
+        // others plan, pin, warm up and retry under the gate: every thread ends (no deadlock), a part that saw the abort
+        // starts no warm-up or re-pin, and the first failure kept is the failing part's
+        {
+            struct Rs {
+                SplitSync s;
+                std::atomic<int> done{0}, late{0};
+                explicit Rs(int n) : s(n) {}
+            };
+            Sweep sw;
+            for (int round = 0; round < 90; ++round) {
+                const int parts = 2 + round % 3, bad = round % parts, at = (round / 3) % 5;
+                auto* rs = new Rs(parts);
+                for (int p = 0; p < parts; ++p)
+                    std::thread([rs, p, parts, bad, at] {
+                        SplitSync& s = rs->s;
+                        int step = 0;
+                        bool failed = false;   // this part's own failure
+                        const auto fails_here = [&] { return failed = failed || (p == bad && step++ == at); };
+                        bool ok = !fails_here() && s.wait(p);
+                        s.pass(p);
+                        ok = ok && !fails_here() && s.wait(parts) && s.wait_pin(p);
+                        if (ok) s.pass_pin(p);
+                        ok = ok && !fails_here() && s.wait_pin(parts);
+                        for (int t = 0; ok && t < 3; ++t) {
+                            {
+                                const bool seen = s.aborted();
+                                strata::core::glmfast::WarmTurn w(&s.gate, false);
+                                if (!w.ok()) {
+                                    ok = false;
+                                    break;
+                                }
+                                if (seen) rs->late.fetch_add(1);   // a warm-up begun after its part saw the abort
+                                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                            }
+                            if (fails_here() || s.aborted()) {
+                                ok = false;
+                                break;
+                            }
+                            const bool seen = s.aborted();
+                            strata::core::glmfast::WarmTurn r(&s.gate, true);
+                            if (!r.ok()) {
+                                ok = false;
+                                break;
+                            }
+                            if (seen) rs->late.fetch_add(1);
+                        }
+                        if (!ok && !failed) s.stopped(p);
+                        s.finish(p, ok);
+                        rs->done.fetch_add(1);
+                    }).detach();
+                const bool all = wait_for(rs->done, parts, 5000);
+                const std::vector<int> f = rs->s.failures();
+                const std::string r = "round " + std::to_string(round) + " (" + std::to_string(parts) + " parts, part " +
+                                      std::to_string(bad) + " fails at step " + std::to_string(at) + ")";
+                sw.expect(all, r + ": " + std::to_string(rs->done.load()) + " ended");
+                if (!all) break;
+                sw.expect(f.size() == 1 && f.front() == bad, r + ": failures " + std::to_string(f.size()) + ", first " +
+                                                                 std::to_string(f.empty() ? -1 : f.front()));
+                sw.expect(rs->late.load() == 0, r + ": " + std::to_string(rs->late.load()) + " turns after the abort");
+            }
+            check("splitsync.random_failure_never_deadlocks_and_names_the_failing_part", sw.ok, sw.why());
+        }
+    }
+    {   // the start's line for a RAM tier short of pinned memory (serve/server.py's ram_oom_of reads it back)
+        using strata::core::glmfast::ram_tier_oom_line;
+        check("oomline.format", ram_tier_oom_line((int64_t) (42.71 * (double) kGi), false) ==
+                                    "glm fast: RAM-TIER-OOM total_gb=42.71 manual=0",
+              ram_tier_oom_line((int64_t) (42.71 * (double) kGi), false));
+        check("oomline.manual_and_rounding", ram_tier_oom_line(41 * kGi + kGi / 2, true) ==
+                                                 "glm fast: RAM-TIER-OOM total_gb=41.50 manual=1" &&
+                                             ram_tier_oom_line(0, false) == "glm fast: RAM-TIER-OOM total_gb=0.00 manual=0",
+              ram_tier_oom_line(41 * kGi + kGi / 2, true));
+        check("oomline.negative_is_zero", ram_tier_oom_line(-5, false) == "glm fast: RAM-TIER-OOM total_gb=0.00 manual=0");
     }
     std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
     if (g_bad) return 1;
