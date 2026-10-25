@@ -960,6 +960,13 @@ int main() {
             return v.load() == want;
         };
         const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        // a thread that said it started (started == 1, just before its blocking call) and still has no answer (r == -1)
+        // 50 ms later: it blocks there.  (The time counts from its start, not from its spawn: a slow spawn is no pass)
+        const auto blocked = [&](const std::atomic<int>& started, const std::atomic<int>& r) {
+            if (!wait_for(started, 1, 2000)) return false;
+            nap(50);
+            return r.load() == -1;
+        };
         {
             auto* g = new WarmGate;
             auto* done = new std::atomic<int>{0};
@@ -1075,10 +1082,13 @@ int main() {
         {
             auto* g = new WarmGate;
             auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
             g->begin_warm();   // another part warms up: the re-pin waits
-            std::thread([g, r] { r->store(g->begin_repin() ? 1 : 0); }).detach();
-            nap(50);
-            const bool waited = r->load() == -1;
+            std::thread([g, r, started] {
+                started->store(1);
+                r->store(g->begin_repin() ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
             g->abort();
             check("warmgate.abort_wakes_a_waiting_repin", waited && wait_for(*r, 0, 2000),
                   waited ? "still waiting or took the turn: " + std::to_string(r->load()) : "did not wait");
@@ -1087,10 +1097,13 @@ int main() {
         {
             auto* g = new WarmGate;
             auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
             g->begin_repin();   // another part re-pins: the warm-up waits
-            std::thread([g, r] { r->store(g->begin_warm() ? 1 : 0); }).detach();
-            nap(50);
-            const bool waited = r->load() == -1;
+            std::thread([g, r, started] {
+                started->store(1);
+                r->store(g->begin_warm() ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
             g->abort();
             check("warmgate.abort_wakes_a_waiting_warm", waited && wait_for(*r, 0, 2000),
                   waited ? "still waiting or took the turn: " + std::to_string(r->load()) : "did not wait");
@@ -1099,6 +1112,7 @@ int main() {
         {
             WarmGate g;
             g.abort();
+            g.abort();   // (twice: as once)
             bool turn_ok = true;
             {
                 strata::core::glmfast::WarmTurn t(&g, false);
@@ -1120,6 +1134,11 @@ int main() {
             return v.load() == want;
         };
         const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        const auto blocked = [&](const std::atomic<int>& started, const std::atomic<int>& r) {   // (as the gate's)
+            if (!wait_for(started, 1, 2000)) return false;
+            nap(50);
+            return r.load() == -1;
+        };
         {
             SplitSync s(2);
             bool ok = s.wait(0) && s.wait_pin(0);
@@ -1135,28 +1154,35 @@ int main() {
         {
             auto* s = new SplitSync(2);
             auto* r = new std::atomic<int>{-1};
-            std::thread([s, r] { r->store(s->wait(1) ? 1 : 0); }).detach();   // part 1 waits for part 0's plan
-            nap(50);
-            const bool waited = r->load() == -1;
+            auto* started = new std::atomic<int>{0};
+            std::thread([s, r, started] {   // part 1 waits for part 0's plan
+                started->store(1);
+                r->store(s->wait(1) ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
             s->fail(0);
             check("splitsync.abort_wakes_wait", waited && wait_for(*r, 0, 2000), std::to_string(r->load()));
         }
         {
             auto* s = new SplitSync(2);
             auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
             s->pass_pin(0);
-            std::thread([s, r] { r->store(s->wait_pin(2) ? 1 : 0); }).detach();   // part 0 waits for every pin
-            nap(50);
-            const bool waited = r->load() == -1;
+            std::thread([s, r, started] {   // part 0 waits for every pin
+                started->store(1);
+                r->store(s->wait_pin(2) ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
             s->fail(1);   // part 1's pin was refused
             check("splitsync.abort_wakes_wait_pin", waited && wait_for(*r, 0, 2000), std::to_string(r->load()));
         }
         {
             SplitSync s(3);
             s.finish(0, true);
-            s.fail(2);
+            s.finish(2, false);   // (a failed part's end aborts and records it)
             check("splitsync.after_abort_every_wait_says_so", !s.wait(0) && !s.wait(1) && !s.wait_pin(0) &&
-                                                                  !s.wait_pin(3) && s.aborted() && s.gate.aborted());
+                                                                  !s.wait_pin(3) && s.aborted() && s.gate.aborted() &&
+                                                                  s.failures() == std::vector<int>({2}));
         }
         {
             SplitSync s(3);
@@ -1306,6 +1332,11 @@ int main() {
             return v.load() == want;
         };
         const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        const auto blocked = [&](const std::atomic<int>& started, const std::atomic<int>& r) {   // (as the gate's)
+            if (!wait_for(started, 1, 2000)) return false;
+            nap(50);
+            return r.load() == -1;
+        };
         {
             SplitSync s(4);
             s.fail(3);
@@ -1357,11 +1388,14 @@ int main() {
             s->pass(3);
             s->pass(0);
             s->pass(0);
-            std::thread([s, r] { r->store(s->wait(3) ? 1 : 0); }).detach();   // needs parts 1 and 2
-            nap(50);
-            const bool held = r->load() == -1;
+            auto* started = new std::atomic<int>{0};
+            std::thread([s, r, started] {   // needs parts 1 and 2
+                started->store(1);
+                r->store(s->wait(3) ? 1 : 0);
+            }).detach();
+            const bool held = blocked(*started, *r);
             s->pass(2);   // out of order: part 1 is still missing
-            nap(50);
+            nap(50);   // (the waiter has long been waiting: a wrong wake-up would show within this)
             const bool still = r->load() == -1;
             s->pass(1);
             check("splitsync.gap.turn_passes_only_in_part_order", held && still && wait_for(*r, 1, 2000),
@@ -1370,38 +1404,36 @@ int main() {
         {   // finish() in any order: the turns of a part that never reached them pass, and the later parts go on
             auto* s = new SplitSync(3);
             auto* r = new std::atomic<int>{-1};
-            std::thread([s, r] { r->store(s->wait(3) && s->wait_pin(3) ? 1 : 0); }).detach();
+            auto* started = new std::atomic<int>{0};
+            std::thread([s, r, started] {
+                started->store(1);
+                r->store(s->wait(3) && s->wait_pin(3) ? 1 : 0);
+            }).detach();
             s->finish(2, true);
             s->finish(0, true);
-            nap(50);
-            const bool held = r->load() == -1;   // part 1 has not ended
+            const bool held = blocked(*started, *r);   // part 1 has not ended
             s->finish(1, true);
             check("splitsync.gap.finish_out_of_order_passes_every_turn", held && wait_for(*r, 1, 2000) &&
                                                                               !s->aborted() && s->failures().empty(),
                   std::to_string(r->load()));
-        }
-        {
-            SplitSync s(2);
-            s.finish(0, false);
-            check("splitsync.gap.finish_failed_aborts_and_records", s.aborted() && s.failures() == std::vector<int>({0}) &&
-                                                                       !s.wait(1) && !s.wait_pin(1));
         }
         {   // one abort wakes a waiter at every point at once: the plan turn, the pin turn, the warm-up and the re-pin
             Sweep sw;
             for (int round = 0; round < 20; ++round) {
                 struct St {
                     SplitSync s{3};
-                    std::atomic<int> back{0}, ok{0};
+                    std::atomic<int> back{0}, ok{0}, started{0};
                 };
                 auto* st = new St;
                 WarmGate& g = st->s.gate;
                 g.begin_repin();   // the gate is busy: a warm-up and a re-pin both wait
-                std::thread([st] { st->ok += st->s.wait(2) ? 1 : 0; st->back.fetch_add(1); }).detach();
-                std::thread([st] { st->ok += st->s.wait_pin(2) ? 1 : 0; st->back.fetch_add(1); }).detach();
-                std::thread([st] { st->ok += st->s.gate.begin_warm() ? 1 : 0; st->back.fetch_add(1); }).detach();
-                std::thread([st] { st->ok += st->s.gate.begin_repin() ? 1 : 0; st->back.fetch_add(1); }).detach();
-                nap(20);
-                const int early = st->back.load();
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.wait(2) ? 1 : 0; st->back.fetch_add(1); }).detach();
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.wait_pin(2) ? 1 : 0; st->back.fetch_add(1); }).detach();
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.gate.begin_warm() ? 1 : 0; st->back.fetch_add(1); }).detach();
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.gate.begin_repin() ? 1 : 0; st->back.fetch_add(1); }).detach();
+                const bool all_started = wait_for(st->started, 4, 2000);
+                nap(20);   // (from their start: each has reached its wait)
+                const int early = all_started ? st->back.load() : -1;
                 st->s.fail(1);
                 const bool all = wait_for(st->back, 4, 3000);
                 sw.expect(early == 0 && all && st->ok.load() == 0 && st->s.failures() == std::vector<int>({1}),
@@ -1443,25 +1475,26 @@ int main() {
                 WarmTurn t(&g, true);
                 again_repin = t.ok();
             }
-            check("warmgate.gap.held_turn_ends_cleanly_after_abort", inside_ok && aborted_in && !again && !again_repin &&
-                                                                       g.aborted());
+            check("warmgate.gap.held_turn_runs_on_after_abort_and_the_next_is_refused",
+                  inside_ok && aborted_in && !again && !again_repin && g.aborted());
         }
-        {   // a held re-pin, then abort: the warm-up waiting behind it wakes false
+        {   // (no abort) a turn is given back when its WarmTurn's scope ends: the re-pin waiting on it goes on
             auto* g = new WarmGate;
             auto* r = new std::atomic<int>{-1};
-            const bool got = g->begin_repin();
-            std::thread([g, r] { r->store(g->begin_warm() ? 1 : 0); }).detach();
-            nap(30);
-            g->abort();
-            const bool woke = wait_for(*r, 0, 2000);
-            g->end_repin();
-            check("warmgate.gap.abort_while_repin_held_wakes_the_warm", got && woke);
-        }
-        {   // abort twice, and before anything waits
-            WarmGate g;
-            g.abort();
-            g.abort();
-            check("warmgate.gap.abort_is_idempotent", g.aborted() && !g.begin_warm() && !g.begin_repin());
+            auto* started = new std::atomic<int>{0};
+            bool waited = false;
+            {
+                WarmTurn t(g, false);
+                std::thread([g, r, started] {
+                    started->store(1);
+                    const bool got = g->begin_repin();
+                    r->store(got ? 1 : 0);
+                    if (got) g->end_repin();
+                }).detach();
+                waited = blocked(*started, *r);
+            }
+            check("warmgate.gap.turn_given_back_when_its_scope_ends", waited && wait_for(*r, 1, 2000),
+                  std::to_string(r->load()));
         }
         {   // without an abort two warm-ups share the gate
             WarmGate g;
