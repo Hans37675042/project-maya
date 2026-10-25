@@ -1507,6 +1507,56 @@ int main() {
             check("oomline.gap.reads_back", sw.ok, sw.why());
         }
     }
+    {   // a split start's end when a part failed (split_start_end): the earliest failure's error and the later ones after
+        // "; then ", and the RAM-TIER-OOM line only when that earliest failure was short of pinned memory
+        using strata::core::glmfast::split_start_end;
+        using strata::core::glmfast::SplitPartEnd;
+        const auto part = [](bool ok, const char* err, int64_t try_b, bool manual, bool oom) {
+            SplitPartEnd p;
+            p.ok = ok;
+            p.err = err;
+            p.tier_try_b = try_b;
+            p.tier_manual = manual;
+            p.tier_oom = oom;
+            return p;
+        };
+        {
+            const auto e = split_start_end({}, {});
+            check("splitend.empty_is_no_failure", !e.failed && e.err.empty() && e.oom_line.empty());
+            const auto ok2 = split_start_end({}, {part(true, "", 20 * kGi, false, false), part(true, "", 20 * kGi, true, false)});
+            check("splitend.all_ok_is_no_failure", !ok2.failed && ok2.err.empty() && ok2.oom_line.empty());
+        }
+        {   // part 1's pin refused first; part 0 stopped on the abort (not in failures), part 2 failed of its own after
+            const auto e = split_start_end({1, 2}, {part(false, "CUDA0 stopped", 21 * kGi, false, true),
+                                                    part(false, "CUDA1 refused", 20 * kGi, false, true),
+                                                    part(false, "CUDA2 other", -1, false, false)});
+            check("splitend.earliest_then_later_without_the_stopped_part", e.failed && e.err == "CUDA1 refused; then CUDA2 other",
+                  e.err);
+            check("splitend.total_sums_every_part_and_unset_tries_count_zero",
+                  e.oom_line == "glm fast: RAM-TIER-OOM total_gb=41.00 manual=0", e.oom_line);
+        }
+        {   // the earliest failure was not short of pinned memory: no line, even when a later one was
+            const auto e = split_start_end({0, 1}, {part(false, "CUDA0 file", 10 * kGi, false, false),
+                                                    part(false, "CUDA1 refused", 10 * kGi, false, true)});
+            check("splitend.earliest_not_oom_no_line", e.failed && e.err == "CUDA0 file; then CUDA1 refused" &&
+                                                           e.oom_line.empty(), e.oom_line);
+        }
+        {   // a manual part among auto ones: the whole start is manual; negative tries count 0
+            const auto e = split_start_end({0}, {part(false, "CUDA0 refused", 30 * kGi, false, true),
+                                                 part(true, "", -7, true, false), part(true, "", kGi / 2, false, false)});
+            check("splitend.manual_mixed_with_auto_is_manual",
+                  e.oom_line == "glm fast: RAM-TIER-OOM total_gb=30.50 manual=1", e.oom_line);
+        }
+        {   // no failures recorded (the sequential load, or a failure before the split's turns): the first part not ok
+            const auto e = split_start_end({}, {part(true, "", 8 * kGi, false, false), part(false, "CUDA1 refused", 4 * kGi, false, true),
+                                                part(false, "CUDA2 late", 4 * kGi, false, false)});
+            check("splitend.first_not_ok_stands_for_the_failures", e.failed && e.err == "CUDA1 refused" &&
+                                                                       e.oom_line == "glm fast: RAM-TIER-OOM total_gb=16.00 manual=0",
+                  e.err + " | " + e.oom_line);
+            const auto r = split_start_end({-1, 5}, {part(true, "", 0, false, false), part(false, "CUDA1 x", 0, false, false)});
+            check("splitend.out_of_range_failures_are_ignored", r.failed && r.err == "CUDA1 x", r.err);
+        }
+    }
     {   // how a part's RAM tier was sized: manual (the RAM-TIER-OOM line's manual=1) only for a size not the engine's own
         // choice; a staging-only tier the engine chose itself is not manual, and it never shrinks in-engine either
         using strata::core::glmfast::ram_tier_sizing;
