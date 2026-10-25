@@ -454,7 +454,9 @@ static void numa_pinned_free(void* p, size_t bytes) {
 }
 
 // The RAM tier's sizing pins through these: STRATA_GLM_PIN_CAP_MB=<MB> (tests) refuses what would take the bytes they
-// hold past it - a Windows pinning cap where there is none.  (The parts of a split pin one after another.)
+// hold past it - a Windows pinning cap where there is none.  (A split's parts pin their first tiers one after another, in
+// part order (SplitLoad::wait_pin / pass_pin); a warm-up retry's re-pin runs alone too - no other part warms up or
+// re-pins meanwhile (g_split_warm) - but beside the other parts' threads, hence the atomic.)
 static std::atomic<int64_t> g_pin_held{0};   // (atomic: a warm-up's retry pins while another part's threads run)
 static cudaError_t pin_alloc(void** p, size_t bytes, unsigned flags) {
     static const int64_t cap = getenv("STRATA_GLM_PIN_CAP_MB") ? std::atoll(getenv("STRATA_GLM_PIN_CAP_MB")) << 20 : -1;
@@ -507,6 +509,9 @@ static bool pin_capped() {
 static std::vector<int64_t> split_plan, split_small;
 static double split_scale = 1.0;
 static bool split_measured = false;
+// a parallel split's warm-ups and their retries' re-pins (glmfast::WarmGate): a re-pin waits until no other part warms
+// up or re-pins, and no part starts a warm-up while one waits or runs.  One GPU never takes it
+static glmfast::WarmGate g_split_warm;
 
 
 // a start-time upload of pageable host data through a pinned buffer of ours (the disk staging): a pageable copy needs
@@ -1846,26 +1851,41 @@ bool Glm5Model::fast_setup(std::string& err) {
         // gives some slots back, up to kWarmRetryMax times, and the warm-up runs again (glmfast::warm_retry_slots).  A
         // size set by hand (STRATA_GLM_RAM_GB, the API's budget) fails with the error, as before.
         const bool tier_auto = !staging_only && !fixed_ram && ram_budget_ < 0 && !F->ram_resident;
+        // A split's parts warm up at once: a retry's re-pin takes g_split_warm's exclusive turn - no other part warms up
+        // or re-pins meanwhile (the room under a cap read while a card streams its experts in is 0.00 GB, the reason for
+        // wait_pin above, and a re-pin there can take the pinned buffers another card's copy needs).  One GPU takes no
+        // turn and never waits
+        glmfast::WarmGate* const gate = split_load_ != nullptr && n_parts_ > 1 ? &g_split_warm : nullptr;
+        // a retry's re-pin: the old arenas go first, then the smaller tier pins with the first
+        // pin's steps (glmfast::pin_tier_classes, guarded: each class leaves the floors of the classes after it pinnable;
+        // at a refusal the room is measured, not stepped down blind).  The other parts' tiers and buffers are pinned
+        // already - no later parts - and the room kept above the tiers stays
         const auto retier = [&](const std::vector<int64_t>& to) {
-            const auto fail_pin = [&](size_t c) {
-                err = "glm fast: the pinned RAM tier did not allocate again after the warm-up ran out of memory (class " +
-                      std::to_string(c) + ")";
-                return false;
-            };
-            // the old arenas go first: the smaller ones pin in the room they leave
-            for (size_t c = 0; c < n_cls; ++c) {
-                unpin(c, F->rc[c].n);
-                F->rc[c].base = nullptr;
-                F->rc[c].n = 0;
-            }
-            F->ram_bytes = 0;
             for (size_t c = 0; c < n_cls; ++c) {
                 auto& R = F->rc[c];
-                int64_t n = to[c];
-                while (!pin(c, n)) {
-                    if (n <= c_least[c]) return fail_pin(c);
-                    n = std::max<int64_t>(c_least[c], n * 7 / 8);
-                }
+                unpin(c, R.n);
+                R.base = nullptr;
+                R.n = 0;
+                R.key.clear();
+                R.st.clear();
+                R.tick.clear();
+            }
+            F->ram_bytes = 0;
+            const auto room_retry = [&](int64_t limit, bool floors_probe) {   // (said at a refusal, as the first pin does)
+                const int64_t r = pin_room(limit);
+                if (!floors_probe)
+                    std::fprintf(stderr, "glm fast: CUDA%d a pinning cap on the warm-up's retry: %.2f GB more pin, the RAM "
+                                         "tier sized to it\n", dev_, (double) r / 1073741824.0);
+                return r;
+            };
+            glmfast::TierPin rp;
+            const bool ok = glmfast::pin_tier_classes(rp, to, c_stride, c_least, 0, keep, false, pin, unpin, room_retry, true);
+            int64_t target = 0;
+            for (size_t c = 0; c < n_cls; ++c) {
+                target += to[c] * c_stride[c];
+                auto& R = F->rc[c];
+                if (cls_p[c] == nullptr) continue;
+                const int64_t n = rp.n[c];
                 R.registered = cls_reg[c] != 0;
                 R.base = (uint8_t*) cls_p[c];
                 R.n = (int) n;
@@ -1874,6 +1894,17 @@ bool Glm5Model::fast_setup(std::string& err) {
                 R.tick.assign((size_t) n, 0);
                 F->ram_bytes += (size_t) n * R.stride;
             }
+            if (!ok) {
+                size_t c = 0;   // the class refused even at its floor
+                while (c < n_cls && cls_p[c] != nullptr) ++c;
+                err = "glm fast: the pinned RAM tier did not allocate again after the warm-up ran out of memory (class " +
+                      std::to_string(c) + ")";
+                return false;
+            }
+            if ((int64_t) F->ram_bytes < target)
+                std::fprintf(stderr, "glm fast: WARNING - CUDA%d the warm-up's retry pinned a %.2f GB RAM tier, under its "
+                                     "%.2f GB target: the room under the pinning cap is short\n", dev_,
+                             (double) F->ram_bytes / 1073741824.0, (double) target / 1073741824.0);
             // what the failed try left: the slot tables, the pool's slots and the lookahead's load words
             std::fill(F->slot_of.begin(), F->slot_of.end(), -1);
             std::fill(F->ram_of.begin(), F->ram_of.end(), -1);
@@ -1900,8 +1931,13 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
             return true;
         };
-        for (int tries = 0; wv == nullptr || std::atoi(wv) != 0; ++tries) {
-            if (fast_warm(err)) break;
+        for (int retries = 0; wv == nullptr || std::atoi(wv) != 0;) {
+            bool warmed;
+            {
+                glmfast::WarmTurn turn(gate, false);   // (a split: no part re-pins while this warm-up runs)
+                warmed = fast_warm(err);
+            }
+            if (warmed) break;
             std::vector<int64_t> have(n_cls), strd(n_cls);
             int64_t was = 0, now = 0;
             for (size_t c = 0; c < n_cls; ++c) {
@@ -1909,12 +1945,21 @@ bool Glm5Model::fast_setup(std::string& err) {
                 strd[c] = (int64_t) F->rc[c].stride;
                 was += have[c] * strd[c];
             }
-            const std::vector<int64_t> to = glmfast::warm_retry_slots(tier_auto, F->warm_cuda_err, tries, have, strd, c_least);
+            const std::vector<int64_t> to = glmfast::warm_retry_slots(tier_auto, F->warm_cuda_err, retries, have, strd, c_least);
             if (to.empty()) return false;
             for (size_t c = 0; c < n_cls; ++c) now += to[c] * strd[c];
             std::fprintf(stderr, "glm fast: CUDA%d warm-up out of memory - RAM tier %.2f -> %.2f GB, retrying (%d of %d)\n",
-                         dev_, (double) was / 1073741824.0, (double) now / 1073741824.0, tries + 1, glmfast::kWarmRetryMax);
-            if (!retier(to)) return false;
+                         dev_, (double) was / 1073741824.0, (double) now / 1073741824.0, retries + 1, glmfast::kWarmRetryMax);
+            // (under a cap every part passed wait_pin before its first warm-up: no wait.  Without one a later part may
+            // still pin its first tier - it never waits on this part there, so this wait ends)
+            if (gate != nullptr) split_load_->wait_pin(n_parts_);
+            bool repinned;
+            {
+                glmfast::WarmTurn turn(gate, true);   // no other part warms up or re-pins meanwhile
+                repinned = retier(to);
+            }
+            if (!repinned) return false;
+            ++retries;
             int64_t slots = 0;
             for (const auto& R : F->rc) slots += R.n;
             std::fprintf(stderr, "glm fast: CUDA%d RAM tier %.2f GB pinned, %lld slots\n", dev_,

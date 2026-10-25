@@ -1,9 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <utility>
 #include <vector>
 
@@ -150,6 +152,8 @@ inline int warm_pool_slots(bool unified, int slots, int experts, int spares) {
 // pinnable, or it is unpinned and takes its share of the measured room; and a share is the floor plus its part of
 // what is left beyond all the floors, so a cap that holds every floor gives every class of every part its floor.
 // (The later parts' floors are estimated from this part's: its floors for each multiple of its plan they plan.)
+// guard: guarded whatever the later parts and the reserve - a warm-up retry's re-pin (fast_setup's retier), which pins
+// near a limit just met and must leave each class after the one pinning its floor, on one GPU too.
 struct TierPin {
     std::vector<int64_t> n;       // the slots each class got (n[c] 0: class c did not pin, the start fails)
     int64_t pin_left = -1;        // the room measured under the cap less the classes pinned since (-1: none measured)
@@ -163,7 +167,7 @@ constexpr int64_t kPinRoomOneGpu = int64_t{512} << 20;   // kPinRoom (glm_fast_p
 template <class Pin, class Unpin, class Room>
 inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, const std::vector<int64_t>& stride,
                              const std::vector<int64_t>& least, int64_t later, int64_t reserve, bool measure_later,
-                             Pin pin, Unpin unpin, Room room) {
+                             Pin pin, Unpin unpin, Room room, bool guard = false) {
     const size_t C = planned.size();
     later = std::max<int64_t>(0, later);
     const auto rest_of = [&](size_t c) {   // the planned bytes from class c on, the later parts' with them
@@ -172,7 +176,7 @@ inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, 
         return rest;
     };
     // a split's part (see above); one GPU, and a split without a cap, are not: their steps are v1.1.20's
-    const bool guarded = later > 0 || reserve > kPinRoomOneGpu;
+    const bool guarded = guard || later > 0 || reserve > kPinRoomOneGpu;
     int64_t own_least = 0, own_plan = 0;   // this part's floors and plan, bytes
     for (size_t k = 0; k < C; ++k) {
         own_least += least[k] * stride[k];
@@ -338,5 +342,68 @@ inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int trie
     }
     return out;
 }
+
+// A split's warm-ups and their retries' re-pins (fast_setup).  The parts warm up at once, but a part whose warm-up ran
+// out of memory pins its smaller tier again only while no other part warms up or re-pins: the room under a pinning
+// cap read while another card streamed its experts in came to 0.00 GB (why every part waits at wait_pin before its
+// first warm-up), and a re-pin near the cap can take the pinned buffers another card's copy needs.  A warm-up is a
+// shared turn, a re-pin an exclusive one:
+//   - a part asks for a re-pin only once its own warm-up has ended (end_warm), and while it waits it holds no turn:
+//     two parts retrying at once take turns, neither waits on the other's warm-up or re-pin
+//   - a re-pin asked for goes before every warm-up not yet begun (the ones running end; none starts past it), so the
+//     re-pin is not held off by the other parts' next warm-ups
+//   - one GPU (no split) never takes the gate: its path has no wait at all
+class WarmGate {
+public:
+    void begin_warm() {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return !repinning_ && repin_asked_ == 0; });
+        ++warming_;
+    }
+    void end_warm() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            --warming_;
+        }
+        cv_.notify_all();
+    }
+    void begin_repin() {
+        std::unique_lock<std::mutex> lk(mu_);
+        ++repin_asked_;
+        cv_.wait(lk, [&] { return !repinning_ && warming_ == 0; });
+        --repin_asked_;
+        repinning_ = true;
+    }
+    void end_repin() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            repinning_ = false;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    int warming_ = 0;       // the parts warming up now
+    int repin_asked_ = 0;   // the parts waiting for their re-pin's turn
+    bool repinning_ = false;
+};
+// a turn of a WarmGate, given back however its scope ends (gate nullptr: none - one GPU)
+class WarmTurn {
+public:
+    WarmTurn(WarmGate* gate, bool repin) : gate_(gate), repin_(repin) {
+        if (gate_ != nullptr) repin_ ? gate_->begin_repin() : gate_->begin_warm();
+    }
+    ~WarmTurn() {
+        if (gate_ != nullptr) repin_ ? gate_->end_repin() : gate_->end_warm();
+    }
+    WarmTurn(const WarmTurn&) = delete;
+    WarmTurn& operator=(const WarmTurn&) = delete;
+
+private:
+    WarmGate* gate_;
+    bool repin_;
+};
 
 }  // namespace strata::core::glmfast
