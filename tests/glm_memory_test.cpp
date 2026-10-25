@@ -2,7 +2,9 @@
 #include "../src/core/glm_memory.hpp"
 
 #undef NDEBUG   // the checks are asserts: keep them in Release builds
+#include <algorithm>
 #include <cassert>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -748,6 +750,167 @@ int main() {
         {   // a class already under its floor (a tiny class of one layer, cap 1) is left alone, the others still shrink
             const auto r = warm_retry_slots(true, kOom, 0, {3, 4000}, {2 * kMi, 6656 * 1024}, {16, 16});
             check("warmretry.class_under_floor_untouched", r.size() == 2 && r[0] == 3 && r[1] < 4000 && r[1] >= 16);
+        }
+        {   // degenerate inputs: nothing to shrink, or inputs that do not line up, give no retry
+            check("warmretry.zero_slots_or_zero_stride_gives_up",
+                  warm_retry_slots(true, kOom, 0, {0}, st1, least1).empty() && warm_retry_slots(true, kOom, 0, {0, 0}, {st1[0], st1[0]}, {16, 16}).empty() &&
+                      warm_retry_slots(true, kOom, 0, {500}, {0}, least1).empty());
+            check("warmretry.negative_slots_give_up", warm_retry_slots(true, kOom, 0, {-5}, st1, least1).empty());
+            check("warmretry.size_mismatch_gives_up", warm_retry_slots(true, kOom, 0, {500, 500}, st1, {16, 16}).empty() &&
+                                                          warm_retry_slots(true, kOom, 0, {500, 500}, {st1[0], st1[0]}, {16}).empty() &&
+                                                          warm_retry_slots(true, kOom, 0, {500}, st1, {16, 16}).empty());
+            const auto r0 = warm_retry_slots(true, kOom, 0, {500}, st1, {0});   // a zero floor is a floor: the tier may shrink, to 0 at most
+            check("warmretry.zero_floor_shrinks_not_below_zero", r0.size() == 1 && r0[0] >= 0 && r0[0] < 500);
+        }
+        {   // every other error code gives up, whatever the tries and the size
+            Sweep sw;
+            for (int code = -2000; code <= 2000; ++code)
+                if (code != kOom) sw.expect(warm_retry_slots(true, code, 0, n30, st1, least1).empty(), "code " + std::to_string(code));
+            for (int code : {INT_MIN, INT_MAX, 1 << 16, kOom + 256, kOom << 8})
+                sw.expect(warm_retry_slots(true, code, 0, n30, st1, least1).empty(), "code " + std::to_string(code));
+            check("warmretry.every_other_code_gives_up", sw.ok, sw.why());
+            check("warmretry.manual_size_with_any_tries_gives_up", warm_retry_slots(false, kOom, -1, n30, st1, least1).empty() &&
+                                                                       warm_retry_slots(false, kOom, kWarmRetryMax - 1, n30, st1, least1).empty());
+        }
+        {   // the tries boundary
+            check("warmretry.last_try_still_retries", !warm_retry_slots(true, kOom, kWarmRetryMax - 1, n30, st1, least1).empty());
+            check("warmretry.tries_extremes", !warm_retry_slots(true, kOom, INT_MIN, n30, st1, least1).empty() &&
+                                                  warm_retry_slots(true, kOom, INT_MAX, n30, st1, least1).empty());
+            int ran = 0;
+            std::vector<int64_t> n = n30;
+            for (int t = 0; t < 100; ++t) {
+                const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                if (r.empty()) break;
+                n = r;
+                ++ran;
+            }
+            check("warmretry.big_tier_runs_exactly_max_retries", ran == kWarmRetryMax, std::to_string(ran) + " retries");
+            ran = 0;
+            n = {40};
+            for (int t = 0; t < 100; ++t) {
+                const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                if (r.empty()) break;
+                n = r;
+                ++ran;
+            }
+            check("warmretry.near_floor_tier_stops_at_floor_before_max", ran == 1 && n[0] == 16, std::to_string(ran) + " retries, " + std::to_string(n[0]) + " slots");
+        }
+        {   // tiny tiers: one slot over the floor goes to the floor; a tier at or under its floor gives up
+            const auto a = warm_retry_slots(true, kOom, 0, {17}, st1, least1);
+            check("warmretry.one_slot_over_floor_lands_on_floor", a.size() == 1 && a[0] == 16);
+            const auto b = warm_retry_slots(true, kOom, 0, {1}, st1, {1});
+            const auto c = warm_retry_slots(true, kOom, 0, {1}, st1, {16});   // under its floor: left alone, nothing to give
+            check("warmretry.below_floor_tier_gives_up", b.empty() && c.empty());
+        }
+        {   // the step equals the margin above the floors exactly
+            const int64_t g = kGi;   // 1 GiB slots, so the step (1 GiB) is one slot
+            const auto a = warm_retry_slots(true, kOom, 0, {5}, {g}, {4});   // margin 1 slot == step: lands on the floor
+            const auto b = warm_retry_slots(true, kOom, 0, {6}, {g}, {4});   // margin 2 slots, step 1: 5
+            const auto c = warm_retry_slots(true, kOom, 0, {4}, {g}, {4});   // no margin
+            check("warmretry.step_equal_to_margin_lands_on_floor", a.size() == 1 && a[0] == 4);
+            check("warmretry.step_half_margin_loses_one_slot", b.size() == 1 && b[0] == 5, b.empty() ? "empty" : std::to_string(b[0]));
+            check("warmretry.no_margin_gives_up", c.empty());
+        }
+        {   // the 5% side of the step, in whole slots
+            const auto r = warm_retry_slots(true, kOom, 0, {100}, {kGi}, {1});   // 100 GiB: 5 GiB
+            const int64_t lost = r.empty() ? -1 : 100 - r[0];
+            check("warmretry.five_percent_step_in_whole_slots", lost >= 5 && lost <= 6, "lost " + std::to_string(lost) + " slots");
+            const auto r2 = warm_retry_slots(true, kOom, 0, {40}, {kGi}, {1});   // 5% = 2 GiB
+            const int64_t lost2 = r2.empty() ? -1 : 40 - r2[0];
+            check("warmretry.step_not_overshot_by_float_rounding", lost2 == 2, "lost " + std::to_string(lost2) + " slots (a step of 2)");
+        }
+        {   // rounding, single and several classes: the sum never goes over the target, every retry is strictly smaller,
+            // the loss is the step (at most one slot per class beyond it), the floors hold
+            Sweep sw;
+            uint64_t seed = 12345;
+            const auto rnd = [&](int64_t lo, int64_t hi) {
+                seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                return lo + (int64_t) ((seed >> 33) % (uint64_t) (hi - lo + 1));
+            };
+            for (int it = 0; it < 4000; ++it) {
+                const size_t C = (size_t) rnd(1, 4);
+                std::vector<int64_t> n(C), st(C), ls(C);
+                for (size_t c = 0; c < C; ++c) {
+                    st[c] = rnd(1, 24) * kMi * 3 / 2;
+                    ls[c] = rnd(0, 20);
+                    n[c] = ls[c] + rnd(0, c % 2 ? 3000 : 40);
+                }
+                int64_t have = 0, fl = 0;
+                for (size_t c = 0; c < C; ++c) {
+                    have += n[c] * st[c];
+                    fl += std::min(n[c], ls[c]) * st[c];
+                }
+                const std::string at = "it=" + std::to_string(it) + " C=" + std::to_string(C);
+                const auto r = warm_retry_slots(true, kOom, 0, n, st, ls);
+                if (have <= fl) {
+                    sw.expect(r.empty(), at + " retried at the floors");
+                    continue;
+                }
+                if (r.size() != C) {
+                    sw.expect(false, at + " gave up above the floors");
+                    continue;
+                }
+                const int64_t step = std::max<int64_t>(kGi, have / 20), target = std::max(fl, have - step), got = bytes(r, st);
+                int64_t slack = 0;
+                for (size_t c = 0; c < C; ++c) {
+                    sw.expect(r[c] <= n[c] && r[c] >= std::min(n[c], ls[c]), at + " class " + std::to_string(c) + " out of range");
+                    slack += st[c];
+                }
+                sw.expect(got < have, at + " not smaller");
+                sw.expect(got <= target, at + " over the target by " + std::to_string(got - target));
+                sw.expect(got >= target - slack, at + " lost far more than the step");
+            }
+            check("warmretry.rounding_sweep_sum_under_target_strictly_smaller", sw.ok, sw.why());
+        }
+        {   // one common factor: the share of its above-floor slots a class keeps agrees across classes to a slot
+            Sweep sw;
+            const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024, 2 * kMi}, ls = {16, 16, 16};
+            for (int64_t a = 100; a <= 6000; a += 997)
+                for (int64_t b = 100; b <= 4000; b += 733) {
+                    const std::vector<int64_t> n = {a, b, 40};
+                    const auto r = warm_retry_slots(true, kOom, 0, n, st, ls);
+                    if (r.size() != 3) {
+                        sw.expect(false, "gave up");
+                        continue;
+                    }
+                    const double fa = (double) (r[0] - 16) / (double) (n[0] - 16), fb = (double) (r[1] - 16) / (double) (n[1] - 16);
+                    sw.expect(std::fabs(fa - fb) <= 1.0 / (double) (n[0] - 16) + 1.0 / (double) (n[1] - 16),
+                              "a=" + std::to_string(a) + " b=" + std::to_string(b) + " shares " + std::to_string(fa) + " vs " + std::to_string(fb));
+                }
+            check("warmretry.classes_shrink_by_one_common_share", sw.ok, sw.why());
+        }
+        {   // a class exactly on its floor stays, the others carry the whole step
+            const auto r = warm_retry_slots(true, kOom, 0, {16, 4000}, {2 * kMi, 6656 * 1024}, {16, 16});
+            check("warmretry.class_on_floor_untouched_others_carry_step", r.size() == 2 && r[0] == 16 && r[1] < 4000 && r[1] >= 16);
+        }
+        {   // a slot bigger than the step (2 GiB slots): one slot is still given up, never past the floor
+            const auto r = warm_retry_slots(true, kOom, 0, {10}, {2 * kGi}, {4});
+            check("warmretry.slot_bigger_than_step_still_shrinks", r.size() == 1 && r[0] < 10 && r[0] >= 4, r.empty() ? "empty" : std::to_string(r[0]));
+            const auto q = warm_retry_slots(true, kOom, 0, {5}, {2 * kGi}, {4});
+            check("warmretry.slot_bigger_than_step_one_over_floor", q.size() == 1 && q[0] == 4);
+        }
+        {   // a very big tier (32 TiB) and one whose byte count passes int64
+            const int64_t nb = int64_t{5} << 20, sb = int64_t{6656} * 1024;
+            const auto big = warm_retry_slots(true, kOom, 0, {nb}, {sb}, {16});
+            check("warmretry.huge_tier_loses_5pct", big.size() == 1 && big[0] < nb && (nb - big[0]) * sb >= nb * sb / 20 - sb);
+            const int64_t nn = int64_t{1} << 50;   // 2^50 slots of 1 MiB: 2^70 bytes
+            const auto ov = warm_retry_slots(true, kOom, 0, {nn}, {kMi}, {16});
+            check("warmretry.byte_count_overflow_is_no_silent_wrong_answer", ov.empty() || (ov.size() == 1 && ov[0] >= 16 && ov[0] < nn),
+                  ov.empty() ? "empty" : std::to_string(ov[0]));
+        }
+        {   // with scaled_slots (a split's scale, never under a floor): retries from its result keep the floor too
+            Sweep sw;
+            for (double scale : {0.01, 0.1, 0.5, 0.97, 1.0, 1.5})
+                for (int64_t plan : {10, 17, 100, 4000}) {
+                    std::vector<int64_t> n = {strata::core::glmfast::scaled_slots(plan, 16, scale)};
+                    for (int t = 0; t < kWarmRetryMax; ++t) {
+                        const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                        if (r.empty()) break;
+                        sw.expect(r[0] < n[0] && r[0] >= std::min<int64_t>(n[0], 16), "scale " + std::to_string(scale) + " plan " + std::to_string(plan) + " t " + std::to_string(t));
+                        n = r;
+                    }
+                }
+            check("warmretry.after_scaled_slots_keeps_floor", sw.ok, sw.why());
         }
     }
     std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
