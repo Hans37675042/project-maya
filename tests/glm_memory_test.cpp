@@ -6,6 +6,9 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <set>
+#include <string>
 #include <vector>
 
 namespace {
@@ -59,7 +62,8 @@ bool pin_part(PinSim& s, Part& p, const std::vector<int64_t>& n, int64_t keep, i
 // A parallel split under a cap as fast_setup runs it: every part plans, then each in turn pins its small buffers and
 // its tier at the split's scale - the first one measuring the room for the later ones.  capped false: v1.1.20's split
 // (no later parts, one GPU's room), the reference
-void pin_split(PinSim& s, std::vector<Part>& parts, bool capped) {
+// ok: false at the first part whose start fails (the later ones are not tried)
+bool run_split(PinSim& s, std::vector<Part>& parts, bool capped) {
     using namespace strata::core::glmfast;
     const int np = (int) parts.size();
     const int64_t keep = pin_room_kept(kRoom, np, capped);
@@ -76,12 +80,17 @@ void pin_split(PinSim& s, std::vector<Part>& parts, bool capped) {
         const auto lr = capped ? split_later(plan, small, i, scale, keep) : std::make_pair(int64_t{0}, keep);
         std::vector<int64_t> n(p.plan.size());
         for (size_t c = 0; c < n.size(); ++c) n[c] = scaled_slots(p.plan[c], p.least[c], scale);
-        assert(pin_part(s, p, n, keep, lr.first, lr.second, capped && !measured && i + 1 < np));
+        if (!pin_part(s, p, n, keep, lr.first, lr.second, capped && !measured && i + 1 < np)) return false;
         if (lr.first > 0 && p.tp.later_measured) {
             scale *= p.tp.later_scale;
             measured = true;
         }
     }
+    return true;
+}
+void pin_split(PinSim& s, std::vector<Part>& parts, bool capped) {
+    const bool ok = run_split(s, parts, capped);
+    assert(ok);
 }
 // v1.1.20's class loop, step for step: what one GPU's tier must still come out as
 bool old_tier(PinSim& s, const std::vector<int64_t>& cls_n, const std::vector<int64_t>& stride, std::vector<int64_t>& out) {
@@ -122,6 +131,65 @@ bool old_tier(PinSim& s, const std::vector<int64_t>& cls_n, const std::vector<in
         out[c] = n;
     }
     return true;
+}
+// Checks added for the dual-GPU pin tier.  A check named in kKnownFail is a finding the current code does not meet
+// and this round does not fix: it must still be red (an expected failure), and the run fails if it turns green.
+// STRATA_TEST_NO_XFAIL=1 reports those as plain failures.
+const std::set<std::string> kKnownFail = {
+    "scaled.plan_under_floor_not_over_plan",
+    "dual2.floors_fit_all_parts_start",
+    "dual3.floors_fit_all_parts_start",
+};
+int g_checks = 0, g_xfail = 0, g_bad = 0;
+void check(const char* id, bool ok, const std::string& detail = "") {
+    ++g_checks;
+    const bool no_xfail = std::getenv("STRATA_TEST_NO_XFAIL") != nullptr;
+    const bool known = !no_xfail && kKnownFail.count(id) != 0;
+    if (known) {
+        if (ok) {
+            ++g_bad;
+            std::printf("UNEXPECTED PASS (strict xfail): %s\n", id);
+        } else {
+            ++g_xfail;
+            std::printf("xfail: %s  %s\n", id, detail.c_str());
+        }
+    } else if (!ok) {
+        ++g_bad;
+        std::printf("FAIL: %s  %s\n", id, detail.c_str());
+    }
+}
+// a sweep keeps its first failing input
+struct Sweep {
+    bool ok = true;
+    int fails = 0;
+    std::string first, last;
+    void expect(bool c, const std::string& what) {
+        if (c) return;
+        if (ok) first = what;
+        ok = false;
+        ++fails;
+        last = what;
+    }
+    std::string why() const { return first + (fails > 1 ? "  [" + std::to_string(fails) + " failing inputs, last: " + last + "]" : ""); }
+};
+std::string gib(int64_t b) { return std::to_string((double) b / (double) kGi) + "GiB"; }
+// the 64 GiB PC's two-card split: a 30.8 GiB plan and a 13.5 GiB one, in two size classes each
+std::vector<Part> two_parts() {
+    const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+    return {Part({9 * kGi, (int64_t) (21.8 * (double) kGi)}, st), Part({4 * kGi, (int64_t) (9.5 * (double) kGi)}, st)};
+}
+std::vector<Part> three_parts() {
+    const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+    return {Part({8 * kGi, 12 * kGi}, st), Part({5 * kGi, 10 * kGi}, st), Part({4 * kGi, 6 * kGi}, st)};
+}
+// the smallest cap that can hold every floor (16 slots a class), the small buffers and the room kept above them
+int64_t floors_cap(const std::vector<Part>& ps, int64_t keep) {
+    int64_t b = keep;
+    for (const Part& p : ps) {
+        b += p.small;
+        for (size_t c = 0; c < p.plan.size(); ++c) b += p.least[c] * p.stride[c];
+    }
+    return b;
 }
 }  // namespace
 
@@ -326,5 +394,230 @@ int main() {
         assert(parts[0].tp.later_measured && !parts[1].tp.later_measured && !parts[2].tp.later_measured);
         assert(s.cap - s.held >= 4 * kRoom);
     }
+    // ---- Dual-GPU pin tier: boundaries, error paths and silent wrong values (check/xfail harness above) ----
+    using strata::core::glmfast::pin_tier_classes;
+    {   // pin_room_kept (spec: a capped split keeps one room per GPU plus the warm-ups'; one GPU or uncapped keeps one)
+        check("room_kept.zero_room", pin_room_kept(0, 1, true) == 0 && pin_room_kept(0, 2, true) == 0 &&
+                                         pin_room_kept(0, 3, false) == 0);
+        check("room_kept.n_parts_edges", pin_room_kept(kRoom, 0, true) == kRoom && pin_room_kept(kRoom, 1, false) == kRoom &&
+                                             pin_room_kept(kRoom, 3, false) == kRoom && pin_room_kept(kRoom, 8, true) == 9 * kRoom);
+    }
+    {   // split_later (spec: a part's later tiers at the split's scale, reserve = keep + the later parts' small buffers)
+        const std::vector<int64_t> plan = {30 * kGi, 13 * kGi}, small = {64 * kMi, 32 * kMi};
+        check("split_later.past_the_end", split_later(plan, small, 2, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom) &&
+                                              split_later(plan, small, 99, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom));
+        check("split_later.negative_part_counts_all",
+              split_later(plan, small, -1, 1.0, kRoom) == std::make_pair(43 * kGi, kRoom + 96 * kMi));
+        check("split_later.scale_zero_keeps_reserve",
+              split_later(plan, small, 0, 0.0, kRoom) == std::make_pair(int64_t{0}, kRoom + 32 * kMi));
+        check("split_later.empty_and_single", split_later({}, {}, 0, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom) &&
+                                                  split_later({7 * kGi}, {kMi}, 0, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom));
+        check("split_later.length_mismatch_ignores_unmatched",
+              split_later({30 * kGi, 13 * kGi, 8 * kGi}, {kMi, kMi}, 0, 1.0, kRoom) == std::make_pair(13 * kGi, kRoom + kMi) &&
+                  split_later({30 * kGi, 13 * kGi}, {kMi, kMi, kMi}, 0, 1.0, kRoom) == std::make_pair(13 * kGi, kRoom + kMi));
+    }
+    {   // scaled_slots (spec: never negative, never under the floor, never over the plan, scale 1.0 changes nothing)
+        check("scaled.scale_one_is_plan", scaled_slots(100, 16, 1.0) == 100 && scaled_slots(0, 16, 1.0) == 0 &&
+                                              scaled_slots(100, 16, 7.0) == 100);
+        check("scaled.floor_cases", scaled_slots(100, 16, 0.0) == 16 && scaled_slots(100, 16, -1.0) == 16 &&
+                                        scaled_slots(0, 16, 0.5) == 16 && scaled_slots(32, 16, 0.5) == 16 &&
+                                        scaled_slots(33, 16, 0.5) == 16 && scaled_slots(34, 16, 0.5) == 17);
+        Sweep sw;
+        for (int64_t n = 16; n <= 400; n += 7)
+            for (double sc = 0.0; sc < 1.0; sc += 0.0625) {
+                const int64_t v = scaled_slots(n, 16, sc);
+                sw.expect(v >= 16 && v <= n, "n=" + std::to_string(n) + " scale=" + std::to_string(sc) + " -> " + std::to_string(v));
+                sw.expect(scaled_slots(n, 16, sc + 0.0625) >= v || sc + 0.0625 >= 1.0, "monotone n=" + std::to_string(n));
+            }
+        check("scaled.in_floor_and_plan_range", sw.ok, sw.why());
+        // a plan already under the floor: the scaled count is 16 over a plan of 10 (the floor wins over the plan)
+        check("scaled.plan_under_floor_not_over_plan", scaled_slots(10, 16, 0.5) <= 10,
+              "scaled_slots(10, 16, 0.5) = " + std::to_string(scaled_slots(10, 16, 0.5)));
+    }
+    {   // pin_tier_classes, one part: boundaries and error paths
+        const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+        {   // no classes at all
+            TierPin tp;
+            const bool ok = pin_tier_classes(tp, {}, {}, {}, 0, kRoom, false, [](size_t, int64_t) { return false; },
+                                             [](size_t, int64_t) {}, [](int64_t, bool) { return int64_t{0}; });
+            check("tier.no_classes", ok && tp.n.empty() && tp.pin_left == -1);
+        }
+        {   // a cap exactly the plan plus the room kept: all of it, no refusal; one byte less: not all, never over the cap
+            Part p({30 * kGi}, {st[0]});
+            PinSim s{p.planned() + kRoom, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 0, kRoom, false);
+            check("tier.cap_equals_plan_plus_keep", ok && p.tp.n[0] == p.plan[0] && p.tp.pin_left == -1 && s.held + kRoom <= s.cap);
+            Part q({30 * kGi}, {st[0]});
+            PinSim t{q.planned() + kRoom - 1, 0};
+            const bool ok2 = pin_part(t, q, q.plan, kRoom, 0, kRoom, false);
+            check("tier.cap_one_byte_short", ok2 && q.tp.n[0] < q.plan[0] && q.tp.n[0] >= 16 && t.held + kRoom <= t.cap,
+                  "ok=" + std::to_string(ok2) + " n=" + std::to_string(q.tp.n[0]) + " plan=" + std::to_string(q.plan[0]));
+        }
+        {   // a class planned at 0 slots: the start fails exactly as v1.1.20's loop did (n 0 is under the floor)
+            Part p({0, 5 * kGi}, st);
+            PinSim a{64 * kGi, 0}, b{64 * kGi, 0};
+            std::vector<int64_t> ref;
+            const bool r = old_tier(a, p.plan, p.stride, ref);
+            const bool ok = pin_part(b, p, p.plan, kRoom, 0, kRoom, false);
+            check("tier.class_planned_zero_as_v1120", ok == r && b.held == a.held, "new=" + std::to_string(ok) + " old=" + std::to_string(r));
+        }
+        {   // every pin refused and no room: the start fails, terminates, holds nothing
+            Part p({9 * kGi, 5 * kGi}, st);
+            int calls = 0, unpins = 0;
+            const bool ok = pin_tier_classes(p.tp, p.plan, p.stride, p.least, 0, kRoom, false,
+                                             [&](size_t, int64_t) { ++calls; return false; },
+                                             [&](size_t, int64_t) { ++unpins; }, [](int64_t, bool) { return int64_t{0}; });
+            check("tier.pin_always_refused", !ok && calls > 0 && calls < 200 && unpins == 0 && p.tp.pin_left == 0);
+            Part q({9 * kGi, 5 * kGi}, st);
+            int qc = 0;
+            const bool ok2 = pin_tier_classes(q.tp, q.plan, q.stride, q.least, 4 * kGi, kRoom, true,
+                                              [&](size_t, int64_t) { ++qc; return false; }, [](size_t, int64_t) {},
+                                              [](int64_t, bool) { return int64_t{0}; });
+            check("tier.pin_always_refused_with_later", !ok2 && qc < 200);
+        }
+        {   // room measured 0 but the floor pins: every class gets its floor, not 0 or a negative count
+            Part p({9 * kGi, 5 * kGi}, st);
+            const bool ok = pin_tier_classes(p.tp, p.plan, p.stride, p.least, 0, kRoom, false,
+                                             [&](size_t c, int64_t k) { return k <= p.least[c]; }, [](size_t, int64_t) {},
+                                             [](int64_t, bool) { return int64_t{0}; });
+            check("tier.room_zero_gives_floor", ok && p.tp.n[0] == 16 && p.tp.n[1] == 16 && p.tp.pin_left == 0);
+        }
+        {   // a cap under the room kept: nothing pins, no count under 0, nothing left held
+            Part p({9 * kGi, 5 * kGi}, st);
+            PinSim s{kRoom / 2, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 0, kRoom, false);
+            bool neg = false;
+            for (const int64_t v : p.tp.n) neg = neg || v < 0;
+            check("tier.cap_below_keep", !ok && !neg && s.held == 0);
+        }
+        {   // a negative `later` is none (clamped): same tier and same cap use as later 0
+            Part p({9 * kGi, 41 * kGi}, st), q({9 * kGi, 41 * kGi}, st);
+            PinSim a{44 * kGi, 0}, b{44 * kGi, 0};
+            const bool oa = pin_part(a, p, p.plan, kRoom, 0, kRoom, true);
+            const bool ob = pin_part(b, q, q.plan, kRoom, -5 * kGi, kRoom, true);
+            check("tier.negative_later_is_zero", oa == ob && p.tp.n == q.tp.n && a.held == b.held && !q.tp.later_measured);
+        }
+        {   // the later parts' probe finds too little (the tier took the room): the tier pins again at its share, no leak
+            Part p({10 * kGi}, {st[0]});
+            PinSim s{p.planned() + kRoom, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 5 * kGi, kRoom, true);
+            Sweep sw;
+            sw.expect(ok, "start failed");
+            sw.expect(p.tp.repinned && p.tp.later_measured && p.tp.later_room >= 0, "not repinned/measured");
+            sw.expect(p.tp.n.size() == 1 && p.tp.n[0] >= 16 && p.tp.n[0] < p.plan[0], "n=" + std::to_string(p.tp.n[0]));
+            sw.expect(s.held == p.pinned(), "held " + gib(s.held) + " != pinned " + gib(p.pinned()) + " (unpin leak)");
+            sw.expect(s.held + kRoom <= s.cap, "over cap");
+            sw.expect(p.tp.later_scale >= 0.0 && p.tp.later_scale <= 1.0, "later_scale " + std::to_string(p.tp.later_scale));
+            check("tier.later_probe_short_repins", sw.ok, sw.why());
+        }
+        {   // the later parts' probe finds all they need (rounded to the probe step): no repin
+            Part p({10 * kGi}, {st[0]});
+            PinSim s{p.planned() + kRoom + 5 * kGi, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 5 * kGi, kRoom, true);
+            check("tier.later_probe_exact_no_repin", ok && !p.tp.repinned && p.tp.later_measured && p.tp.later_scale == 1.0 &&
+                                                         p.tp.n[0] == p.plan[0]);
+        }
+    }
+    {   // One, two and three GPUs under a pinning cap.  Spec: every part gets > 0 of every class, the total plus the room
+        // kept stays under the cap, a roomy cap gives each part its whole plan, a count is never negative or over its plan
+        for (int np = 1; np <= 3; ++np) {
+            const std::string tag = "dual" + std::to_string(np);
+            const auto make = [&]() { return np == 1 ? std::vector<Part>{two_parts()[0]} : (np == 2 ? two_parts() : three_parts()); };
+            int64_t total_plan = 0, smalls = 0;
+            for (const Part& p : make()) {
+                total_plan += p.planned();
+                smalls += p.small;
+            }
+            const int64_t keep = pin_room_kept(kRoom, np, true);
+            Sweep inv, floors, full, tier0;
+            for (int64_t cap = 0; cap <= total_plan + smalls + keep + 3 * kGi; cap += 173 * kMi + 12345) {
+                std::vector<Part> parts = make();
+                PinSim s{cap, 0};
+                const bool ok = run_split(s, parts, true);
+                const std::string at = "cap=" + gib(cap) + " ";
+                if (ok) {
+                    int64_t sum = 0;
+                    for (size_t i = 0; i < parts.size(); ++i) {
+                        const Part& p = parts[i];
+                        sum += p.small + p.pinned();
+                        for (size_t c = 0; c < p.tp.n.size(); ++c) {
+                            const std::string pc = "part " + std::to_string(i) + " class " + std::to_string(c);
+                            inv.expect(p.tp.n[c] > 0, at + pc + " got 0");
+                            inv.expect(p.tp.n[c] >= 16, at + pc + " under its floor");
+                            inv.expect(p.tp.n[c] <= p.plan[c], at + pc + " over its plan: " + std::to_string(p.tp.n[c]) + ">" + std::to_string(p.plan[c]));
+                        }
+                        tier0.expect(p.pinned() > 0, at + "part " + std::to_string(i) + " tier 0");
+                    }
+                    inv.expect(s.held == sum, at + "held " + gib(s.held) + " != parts' sum " + gib(sum));
+                    inv.expect(s.held + keep <= cap, at + "total " + gib(s.held) + " + kept " + gib(keep) + " over the cap");
+                }
+                // one GPU keeps v1.1.20 (a class that pins whole before the first refusal may leave the next one nothing): not a dual spec
+                if (np > 1 && cap >= floors_cap(parts, keep) + kGi) floors.expect(ok, at + "a part's start failed though all floors fit");
+                if (cap >= total_plan + smalls + keep + kGi) {
+                    bool whole = ok;
+                    for (const Part& p : parts) whole = whole && p.pinned() == p.planned();
+                    full.expect(whole, at + "roomy cap but a part is under its plan");
+                }
+            }
+            check((tag + ".total_plus_keep_within_cap_and_counts_in_range").c_str(), inv.ok, inv.why());
+            check((tag + ".every_part_gets_tier").c_str(), tier0.ok, tier0.why());
+            check((tag + ".floors_fit_all_parts_start").c_str(), floors.ok, floors.why());
+            check((tag + ".roomy_cap_whole_plans").c_str(), full.ok, full.why());
+        }
+        {   // one class per part
+            const std::vector<int64_t> st1 = {6656 * 1024};
+            Sweep sw;
+            for (int64_t cap = 0; cap <= 50 * kGi; cap += 211 * kMi + 777) {
+                std::vector<Part> parts = {Part({30 * kGi}, st1), Part({13 * kGi}, st1)};
+                PinSim s{cap, 0};
+                const bool ok = run_split(s, parts, true);
+                const std::string at = "cap=" + gib(cap) + " ";
+                if (ok) {
+                    sw.expect(parts[0].tp.n[0] > 0 && parts[1].tp.n[0] > 0, at + "a part got 0");
+                    sw.expect(s.held + 3 * kRoom <= cap, at + "total over the cap");
+                    sw.expect(parts[0].tp.n[0] <= parts[0].plan[0] && parts[1].tp.n[0] <= parts[1].plan[0], at + "over plan");
+                }
+                if (cap >= 43 * kGi + 128 * kMi + 3 * kRoom + kGi)
+                    sw.expect(ok && parts[0].pinned() == parts[0].planned() && parts[1].pinned() == parts[1].planned(), at + "roomy but not whole");
+                if (cap >= floors_cap(parts, 3 * kRoom) + kGi) sw.expect(ok, at + "floors fit but start failed");
+            }
+            check("dual2.single_class_per_part", sw.ok, sw.why());
+        }
+    }
+    {   // Spec: one GPU, and capped false, give v1.1.20's slots and pin bytes one for one (a 1/2/3-part uncapped split
+        // is v1.1.20's parts pinned one after another; one GPU with the cap flag set keeps the single room)
+        for (int np = 1; np <= 3; ++np) {
+            Sweep un, flag;
+            for (int64_t cap = 0; cap <= 90 * kGi; cap += 191 * kMi + 4321) {
+                for (int mode = 0; mode < 2; ++mode) {
+                    if (mode == 1 && np != 1) continue;   // the cap flag on one GPU
+                    std::vector<Part> parts = np == 1 ? std::vector<Part>{two_parts()[0]} : (np == 2 ? two_parts() : three_parts());
+                    std::vector<Part> mine = parts;
+                    PinSim a{cap, 0}, b{cap, 0};
+                    std::vector<std::vector<int64_t>> refs;
+                    bool ok_ref = true;
+                    for (Part& p : parts) {
+                        a.held += p.small;
+                        std::vector<int64_t> r;
+                        if (!old_tier(a, p.plan, p.stride, r)) {
+                            ok_ref = false;
+                            break;
+                        }
+                        refs.push_back(r);
+                    }
+                    const bool ok = run_split(b, mine, mode == 1);
+                    Sweep& sw = mode == 1 ? flag : un;
+                    const std::string at = "cap=" + gib(cap) + " ";
+                    sw.expect(ok == ok_ref, at + "start ok " + std::to_string(ok) + " vs v1.1.20 " + std::to_string(ok_ref));
+                    sw.expect(a.held == b.held, at + "held " + gib(b.held) + " vs v1.1.20 " + gib(a.held));
+                    for (size_t i = 0; i < refs.size() && ok == ok_ref; ++i) sw.expect(mine[i].tp.n == refs[i], at + "slots differ in part " + std::to_string(i));
+                }
+            }
+            check(("parity" + std::to_string(np) + ".uncapped_as_v1120").c_str(), un.ok, un.why());
+            if (np == 1) check("parity1.cap_flag_one_gpu_as_v1120", flag.ok, flag.why());
+        }
+    }
+    std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
+    if (g_bad) return 1;
     std::puts("GLM memory policy checks passed (CPU only)");
 }
