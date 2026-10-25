@@ -200,19 +200,23 @@ class LogSince(unittest.TestCase):
 
 
 # a scripted engine like test_launch_retry's, but its limit is read from a file at every start (so it can change
-# between a start and restart()) and it can print another failure
+# between a start and restart()) and it can print another failure: always (FAKE_PLAIN_FAIL), while the file
+# FAKE_PLAIN_FILE exists, or when STRATA_GLM_RAM_GB is set (FAKE_PLAIN_FAIL_RAM: a restart fails for another reason).
+# FAKE_MANUAL_FORCE=0|1: the manual flag it prints whatever STRATA_GLM_RAM_GB says (isolates the user-setting gate)
 FAKE = textwrap.dedent(r"""
     import os, sys
     with open(os.environ["FAKE_STARTS"], "a") as f:
         f.write(os.environ.get("STRATA_GLM_RAM_GB", "-") + "\n")
     ram = os.environ.get("STRATA_GLM_RAM_GB") or None
     ok = float(open(os.environ["FAKE_OK_FILE"]).read())
-    if os.environ.get("FAKE_PLAIN_FAIL"):
+    if (os.environ.get("FAKE_PLAIN_FAIL") or os.path.exists(os.environ.get("FAKE_PLAIN_FILE", "")) or
+            (os.environ.get("FAKE_PLAIN_FAIL_RAM") and ram is not None)):
         sys.stderr.write("error: something else\n")
         sys.exit(1)
     if ram is None or float(ram) > ok:
         total = float(ram) if ram else float(os.environ["FAKE_AUTO_GB"])
-        sys.stderr.write("glm fast: RAM-TIER-OOM total_gb=%.2f manual=%d\n" % (total, 1 if ram else 0))
+        manual = os.environ.get("FAKE_MANUAL_FORCE") or (1 if ram else 0)
+        sys.stderr.write("glm fast: RAM-TIER-OOM total_gb=%.2f manual=%s\n" % (total, manual))
         sys.exit(1)
     sys.stdout.write("READY 4096\n"); sys.stdout.flush()
     for ln in sys.stdin:
@@ -238,8 +242,10 @@ class EngineOverFake(unittest.TestCase):
         self.starts = d / "starts.txt"
         self.okf = d / "ok.txt"
         self.okf.write_text("38")
+        self.plainf = d / "plain-fail"   # (exists: every start fails for another reason)
         self.env = {k: v for k, v in os.environ.items() if k not in RAM_SET_KEYS}
-        self.env.update(FAKE_STARTS=str(self.starts), FAKE_OK_FILE=str(self.okf), FAKE_AUTO_GB="42.71")
+        self.env.update(FAKE_STARTS=str(self.starts), FAKE_OK_FILE=str(self.okf), FAKE_AUTO_GB="42.71",
+                        FAKE_PLAIN_FILE=str(self.plainf))
         p = mock.patch.object(server, "wait_gpu_release", lambda pid, timeout=60.0: None)
         p.start()
         self.addCleanup(p.stop)
@@ -326,24 +332,63 @@ class EngineOverFake(unittest.TestCase):
         self.assertEqual(self.tries(), ["-"])
 
     def test_each_user_key_alone_blocks_the_restart(self):
-        for k in RAM_SET_KEYS:
+        # (the engine says manual=0 here: the user's setting alone stands in the way of a restart)
+        for k, first in (("MAYA_GLM_RAM_GB", "-"), ("STRATA_GLM_RAM_GB", "44")):
             with self.subTest(k):
                 self.starts.unlink(missing_ok=True)
                 with self.assertRaises(RuntimeError):
-                    self.start(**{k: "44"})
-                # (the engine only reads STRATA_GLM_RAM_GB here; MAYA_GLM_RAM_GB alone leaves it unset: one start)
-                self.assertEqual(len(self.tries()), 1)
+                    self.start(FAKE_MANUAL_FORCE="0", **{k: "44"})
+                # (the engine only reads STRATA_GLM_RAM_GB here; MAYA_GLM_RAM_GB alone leaves it unset)
+                self.assertEqual(self.tries(), [first])
 
     def test_empty_user_keys_do_not_block(self):
         e = self.start(MAYA_GLM_RAM_GB="", STRATA_GLM_RAM_GB="")
         self.assertEqual(e.max_context, 4096)
-        self.assertGreater(len(self.tries()), 1)
+        self.assertEqual(self.starts.read_text().splitlines(), ["", "40.5", "38"])   # (the first: the empty setting)
 
     def test_os_environ_is_the_users_when_no_env_is_given(self):
-        with mock.patch.dict(os.environ, {**self.env, "STRATA_GLM_RAM_GB": "44"}):
+        # MAYA_GLM_RAM_GB in the OS's environment only: the engine sees no size (manual=0), the env gate alone blocks
+        with mock.patch.dict(os.environ, {**self.env, "MAYA_GLM_RAM_GB": "44"}, clear=True):
             with self.assertRaises(RuntimeError):
                 StrataEngine(str(self.exe), [], log=str(self.log), env=None)
-        self.assertEqual(self.tries(), ["44"])
+        self.assertEqual(self.tries(), ["-"])
+        self.starts.unlink()
+        with mock.patch.dict(os.environ, self.env, clear=True):   # (and without it the same start restarts)
+            self.engines.append(StrataEngine(str(self.exe), [], log=str(self.log), env=None))
+        self.assertEqual(self.tries(), ["-", "40.5", "38"])
+
+    def test_without_a_log_there_is_no_restart(self):
+        # (the RAM-TIER-OOM line is read from the log: no log, no line - documented; maya.py always gives a log)
+        e = object.__new__(StrataEngine)
+        self.engines.append(e)
+        with self.assertRaises(RuntimeError) as cm:
+            e.__init__(str(self.exe), [], log=None, env=self.env)
+        self.assertEqual(str(cm.exception), "the engine exited before it was ready")
+        self.assertEqual(self.tries(), ["-"])
+
+    def test_restart_refused_for_another_reason_names_the_restarts_not_the_ram(self):
+        with self.assertRaises(RuntimeError) as cm:
+            self.start(FAKE_PLAIN_FAIL_RAM="1")
+        self.assertEqual(self.tries(), ["-", "40.5"])
+        msg = str(cm.exception)
+        self.assertIn("1 restart(s) with a smaller RAM tier, the last at STRATA_GLM_RAM_GB=40.5", msg)
+        self.assertNotIn("ran out of pinned RAM", msg)
+
+    def test_remembered_size_then_an_unrelated_failure_names_no_restart(self):
+        e = self.start()
+        self.assertEqual(e.ram_auto_gb, 38.0)
+        self.plainf.write_text("x")
+        with self.assertRaises(RuntimeError) as cm:
+            e.restart()
+        self.assertEqual(self.tries()[3:], ["38"])
+        self.assertEqual(str(cm.exception), f"the engine exited before it was ready (see {self.log})")
+
+    def test_the_log_is_closed_before_the_error(self):
+        e = object.__new__(StrataEngine)
+        self.engines.append(e)
+        with self.assertRaises(RuntimeError):
+            e.__init__(str(self.exe), [], log=str(self.log), env={**self.env, "FAKE_PLAIN_FAIL": "1"})
+        self.assertTrue(e.log.closed)
 
 
 if __name__ == "__main__":

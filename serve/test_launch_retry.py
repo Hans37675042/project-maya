@@ -266,6 +266,32 @@ class EngineRestarts(unittest.TestCase):
         self.start(FAKE_OK_GB="38", FAKE_MANUAL_FORCE="0")
         self.assertGreater(len(self.tries()), 1)
 
+    def keep(self):   # (an engine object kept even when its __init__ raises: its log can be checked after)
+        e = object.__new__(StrataEngine)
+        self.engines.append(e)
+        return e
+
+    def test_an_engine_that_will_not_end_stops_the_restarts(self):
+        self.unkillable = True
+        e = self.keep()
+        with self.assertRaises(RuntimeError) as cm:   # (not the wait's TimeoutExpired)
+            e.__init__(self.exe, [], log=str(self.log), env={**self.env, "FAKE_OK_GB": "38", "FAKE_LINGER": "30"})
+        self.assertEqual(str(cm.exception), f"the engine exited before it was ready (see {self.log})")
+        self.assertEqual(self.tries(), ["-"])
+        self.assertEqual(self.kills, self.engine_pids())
+        self.assertEqual(self.released, [])
+        self.assertTrue(e.log.closed)
+
+    def test_gpus_still_holding_the_engine_stop_the_restarts(self):
+        self.release_ok = False   # (wait_gpu_release timed out: the old engine's memory is not back)
+        e = self.keep()
+        with self.assertRaises(RuntimeError) as cm:
+            e.__init__(self.exe, [], log=str(self.log), env={**self.env, "FAKE_OK_GB": "38"})
+        self.assertEqual(str(cm.exception), f"the engine exited before it was ready (see {self.log})")
+        self.assertEqual(self.tries(), ["-"])
+        self.assertEqual(len(self.released), 1)
+        self.assertTrue(e.log.closed)
+
     def test_refused_engines_are_gone_before_the_next_start(self):
         e = self.start(FAKE_OK_GB="38")
         self.assertTrue(e.alive())
