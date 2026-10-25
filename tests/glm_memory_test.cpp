@@ -1507,6 +1507,21 @@ int main() {
             check("oomline.gap.reads_back", sw.ok, sw.why());
         }
     }
+    {   // STRATA_GLM_PIN_DIAG's line: always a time in the series, what is held and free, and the probe named as one
+        using strata::core::glmfast::pin_diag_text;
+        check("pindiag.series_point_with_probe",
+              pin_diag_text(1, "before-tier", 0.0, 3 * kGi / 2, 12.25, 1) ==
+                  "glm fast: CUDA1 pin-diag before-tier t=0 held=1.50 availphys=12.25 probe256=1",
+              pin_diag_text(1, "before-tier", 0.0, 3 * kGi / 2, 12.25, 1));
+        check("pindiag.refused_probe_and_no_availphys",
+              pin_diag_text(0, "after-refusal", 0.5, 0, -1.0, 0) ==
+                  "glm fast: CUDA0 pin-diag after-refusal t=0.5 held=0.00 availphys=-1 probe256=0",
+              pin_diag_text(0, "after-refusal", 0.5, 0, -1.0, 0));
+        check("pindiag.not_probed",
+              pin_diag_text(0, "after-unpin", 5.0, 40 * kGi, 3.0, -1) ==
+                  "glm fast: CUDA0 pin-diag after-unpin t=5 held=40.00 availphys=3.00 probe256=-",
+              pin_diag_text(0, "after-unpin", 5.0, 40 * kGi, 3.0, -1));
+    }
     {   // a split part's load that ends anywhere but its success aborts the split there and then (SplitFailOnExit): the
         // other parts stop at their next turn or phase boundary, not after loading all their weights
         using strata::core::glmfast::SplitFailOnExit;
