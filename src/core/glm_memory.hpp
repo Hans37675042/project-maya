@@ -315,7 +315,7 @@ inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int trie
     int64_t have = 0, floor_b = 0;
     std::vector<int64_t> keep(C);   // a class's floor (or all of it, where it holds less)
     for (size_t c = 0; c < C; ++c) {
-        keep[c] = std::min(n[c], least[c]);
+        keep[c] = std::max<int64_t>(0, std::min(n[c], least[c]));   // (a negative floor is 0: no class goes under 0)
         have += n[c] * stride[c];
         floor_b += keep[c] * stride[c];
     }
