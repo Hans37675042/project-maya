@@ -246,7 +246,7 @@ class EngineOverFake(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if k not in RAM_SET_KEYS}
         self.env.update(FAKE_STARTS=str(self.starts), FAKE_OK_FILE=str(self.okf), FAKE_AUTO_GB="42.71",
                         FAKE_PLAIN_FILE=str(self.plainf))
-        p = mock.patch.object(server, "wait_gpu_release", lambda pid, timeout=60.0: None)
+        p = mock.patch.object(server, "wait_gpu_release", lambda pid, timeout=60.0: True)   # (released)
         p.start()
         self.addCleanup(p.stop)
         self.engines = []
