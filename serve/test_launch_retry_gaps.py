@@ -69,7 +69,7 @@ class RetryBoundaries(unittest.TestCase):
         return ram_retry_gb(line(f"{total:.2f}", manual), env or {}, launcher, restarts)
 
     def test_exact_half_steps(self):
-        # total - step lands exactly on a multiple of 0.5: no rounding loss (the 1e-9 slack, not one step lower)
+        # total - step lands exactly on a multiple of 0.5: no rounding loss (no float error drops it a step lower)
         self.assertEqual(self.gb(40.0), 38.0)    # 5% = 2.0
         self.assertEqual(self.gb(30.0), 28.5)    # 5% = 1.5
         self.assertEqual(self.gb(60.0), 57.0)    # 5% = 3.0
