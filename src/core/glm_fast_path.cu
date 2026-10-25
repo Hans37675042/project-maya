@@ -492,6 +492,42 @@ static int64_t pin_room(int64_t limit) {
     return got;
 }
 
+// STRATA_GLM_PIN_DIAG=1 (a diagnosis, off by default - and then nothing below runs): what pins and how much RAM is free
+// around the RAM tier's pins, to tell pinned pages given back late after a free from physical pages run out.  A line is
+// "glm fast: CUDA<dev> pin-diag <when> [t=<s>] room=<GB that pin now, probed up to 40 GB and freed again> availphys=<the
+// free physical RAM, GB; -1 off Windows>"; a series is the line at once and 0.5, 2 and 5 s after its event
+static bool pin_diag_on() {
+    static const bool on = [] {
+        const char* v = getenv("STRATA_GLM_PIN_DIAG");
+        return v != nullptr && std::atoi(v) != 0;
+    }();
+    return on;
+}
+static void pin_diag_line(int dev, const char* when, double t) {
+    const int64_t r = pin_room((int64_t) 40 << 30);   // (pin_alloc / pin_free: g_pin_held as it was)
+    double avail = -1.0;
+#ifdef _WIN32
+    MEMORYSTATUSEX ms{};
+    ms.dwLength = sizeof ms;
+    if (GlobalMemoryStatusEx(&ms)) avail = (double) ms.ullAvailPhys / 1073741824.0;
+#endif
+    char at[32] = "";
+    if (t >= 0) std::snprintf(at, sizeof at, " t=%g", t);
+    if (avail >= 0)
+        std::fprintf(stderr, "glm fast: CUDA%d pin-diag %s%s room=%.2f availphys=%.2f\n", dev, when, at,
+                     (double) r / 1073741824.0, avail);
+    else
+        std::fprintf(stderr, "glm fast: CUDA%d pin-diag %s%s room=%.2f availphys=-1\n", dev, when, at,
+                     (double) r / 1073741824.0);
+}
+static void pin_diag_series(int dev, const char* when) {
+    const auto t0 = std::chrono::steady_clock::now();
+    for (const double t : {0.0, 0.5, 2.0, 5.0}) {
+        std::this_thread::sleep_until(t0 + std::chrono::milliseconds((int64_t) (t * 1000.0)));
+        pin_diag_line(dev, when, t);
+    }
+}
+
 // Where a pinning cap applies - Windows, whose driver pins less than the free RAM (STRATA_GLM_PIN_CAP_MB simulates one
 // elsewhere) - a split's parts share the room under it: each GPU keeps kPinRoom above the tiers for its driver and the
 // split one more for its warm-ups (STRATA_GLM_RAM_GB=44 on two GPUs and 64 GB: the tiers pinned with at least 0.5 GB
@@ -1654,6 +1690,7 @@ bool Glm5Model::fast_setup(std::string& err) {
             // part measures for all of them (below), so the last one is not left whatever the first ones did not take
             if (!split_load_->wait_pin(part_)) return split_stop(err);
         }
+        if (pin_diag_on()) pin_diag_line(dev_, "before-tier", -1.0);
         // the small pinned buffers first - the table updates and the disk reads' staging (an expert a routed entry):
         // where the driver caps what can be pinned (Windows: an RTX 5090 Laptop with 64 GB, the cap reached at a 45.3
         // GB tier, #67) the tier below shrinks to fit instead of the start failing on them after it
@@ -1709,6 +1746,17 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         std::vector<void*> cls_p(n_cls, nullptr);
         std::vector<char> cls_reg(n_cls, 0);
+        // (STRATA_GLM_PIN_DIAG: a refused pin, or a room measured at 0 - a series for the first three, a line after)
+        int diag_series = 3;
+        const auto diag_refused = [&] {
+            if (!pin_diag_on()) return;
+            if (diag_series > 0) {
+                --diag_series;
+                pin_diag_series(dev_, "after-refusal");
+            } else {
+                pin_diag_line(dev_, "after-refusal", 0.0);
+            }
+        };
         const auto pin = [&](size_t c, int64_t n) {
             const size_t bytes = (size_t) n * cls_stride[c];
             void* p = nullptr;
@@ -1732,6 +1780,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 pin_free(p, bytes);
             }
             cudaGetLastError();
+            diag_refused();
             return false;
         };
         const auto unpin = [&](size_t c, int64_t n) {
@@ -1742,6 +1791,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         };
         const auto room = [&](int64_t limit, bool for_later) {
             const int64_t r = pin_room(limit);
+            if (r == 0) diag_refused();
             if (!for_later) {
                 if (later_b > 0)
                     std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin, the RAM tier sized to its "
@@ -1764,6 +1814,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                          (double) tp.later_room / 1073741824.0, (double) later_b / 1073741824.0,
                          (double) reserve_b / 1073741824.0,
                          tp.repinned ? "short: this tier pinned again at its share" : "they fit");
+        if (tp.later_room >= 0 && pin_diag_on()) pin_diag_series(dev_, "after-measure");
         if (split_cap && later_b > 0 && tp.later_measured) {
             split_scale *= tp.later_scale;
             split_measured = true;
@@ -1899,8 +1950,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                 R.tick.clear();
             }
             F->ram_bytes = 0;
+            if (pin_diag_on()) pin_diag_series(dev_, "after-unpin");
             const auto room_retry = [&](int64_t limit, bool floors_probe) {   // (said at a refusal, as the first pin does)
                 const int64_t r = pin_room(limit);
+                if (r == 0) diag_refused();
                 if (!floors_probe)
                     std::fprintf(stderr, "glm fast: CUDA%d a pinning cap on the warm-up's retry: %.2f GB more pin, the RAM "
                                          "tier sized to it\n", dev_, (double) r / 1073741824.0);
