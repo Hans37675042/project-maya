@@ -5,8 +5,10 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -356,6 +358,18 @@ inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int trie
 //   - one GPU (no split) never takes the gate: its path has no wait at all
 //   - an aborted split (a part failed, SplitSync::fail): every waiter wakes without a turn, and no turn is given after -
 //     a begin_ returns false then.  A turn already held runs on and is given back as before
+// The start's line when it failed for want of pinned memory - a RAM tier's pin refused, or a warm-up out of memory
+// (warm_oom_class) - with the RAM tiers this start set out to pin (all GPUs, GB of 2^30 bytes) and whether their size
+// was set by hand (STRATA_GLM_RAM_GB, the API's budget) or is not the auto size (staging only, RAM-resident).  Within one
+// process the tier cannot pin again what it gave back (Windows: ~32 GB unpinned, then not even 256 MB pinned), so
+// serve/server.py starts the engine again with a smaller STRATA_GLM_RAM_GB from it (ram_retry_gb) - manual=0 only
+inline std::string ram_tier_oom_line(int64_t total_bytes, bool manual) {
+    char b[96];
+    std::snprintf(b, sizeof b, "glm fast: RAM-TIER-OOM total_gb=%.2f manual=%d",
+                  (double) std::max<int64_t>(0, total_bytes) / 1073741824.0, manual ? 1 : 0);
+    return b;
+}
+
 class WarmGate {
 public:
     bool begin_warm() {

@@ -1287,6 +1287,16 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         if (!failed.empty()) {
             err = errs[(size_t) failed[0]];
             for (size_t k = 1; k < failed.size(); ++k) err += "; then " + errs[(size_t) failed[k]];
+            // short of pinned memory first: the line with every part's tier (planned or pinned) - the launcher's size
+            if (parts[(size_t) failed[0]]->tier_oom_) {
+                int64_t total = 0;
+                bool manual = false;
+                for (const Glm5Model* p : parts) {
+                    total += std::max<int64_t>(0, p->tier_try_b_);
+                    manual = manual || p->tier_manual_;
+                }
+                tier_oom_report(total, manual);
+            }
             return false;
         }
         for (int i = n - 1; i >= 1; --i) parts[(size_t) i - 1]->split_next_ = std::move(owned[(size_t) i]);
@@ -1320,6 +1330,15 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->profile_path_ = profile_path_;   // every part reads the same profile
         m->head_half_ = i == helper;
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
+            if (m->tier_oom_) {   // (the line with the tiers of the parts loaded and this one's)
+                int64_t total = 0;
+                bool manual = false;
+                for (const Glm5Model* p = this; p != nullptr; p = p == m ? nullptr : p->split_next_.get()) {
+                    total += std::max<int64_t>(0, p->tier_try_b_);
+                    manual = manual || p->tier_manual_;
+                }
+                tier_oom_report(total, manual);
+            }
             if (prev != nullptr) prev->split_next_.reset();
             return false;
         }
@@ -3625,6 +3644,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     }
     if (fast_mode_ && !fast_setup(err)) {
         if (split_load_ != nullptr) split_load_->fail(part_);   // (now: the others stop before their own errors)
+        else if (n_parts_ <= 1 && tier_oom_) tier_oom_report(tier_try_b_, tier_manual_);   // (a split's: its load)
         return false;
     }
     reset();

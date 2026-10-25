@@ -656,7 +656,16 @@ bool Glm5Model::split_stop(std::string& err) {
     return false;
 }
 
+// the line a start short of pinned memory ends with (glmfast::ram_tier_oom_line): serve/server.py starts the engine
+// again with a smaller STRATA_GLM_RAM_GB from it
+void Glm5Model::tier_oom_report(int64_t total_b, bool manual) const {
+    std::fprintf(stderr, "%s\n", glmfast::ram_tier_oom_line(total_b, manual).c_str());
+}
+
 bool Glm5Model::fast_setup(std::string& err) {
+    tier_try_b_ = -1;
+    tier_manual_ = false;
+    tier_oom_ = false;
     cudaSetDevice(dev_);
     auto* F = new FastState();
     fast_ = F;
@@ -1542,6 +1551,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         if (const char* h = getenv("STRATA_GLM_RAM_HEADROOM_GB")) head_gb = std::max(0.0, std::atof(h));
         const int64_t head_b = (int64_t) (head_gb * 1073741824.0);
         const bool fixed_ram = getenv("STRATA_GLM_RAM_GB") != nullptr;
+        tier_manual_ = staging_only || fixed_ram || ram_budget_ >= 0 || F->ram_resident;
         if (budget < 0) {
             if (total < 0) {
                 if (const char* rg = getenv("STRATA_GLM_RAM_GB")) {
@@ -1609,6 +1619,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
+        tier_try_b_ = 0;
+        for (size_t c = 0; c < cls_n.size(); ++c) tier_try_b_ += cls_n[c] * (int64_t) cls_stride[c];
         // (the small pinned buffers below: the table updates', and the disk reads' staging)
         const int64_t small_b = (int64_t) (FastState::kMaxUpd * (sizeof(int) + sizeof(unsigned long long)) +
                                            (size_t) g.n_exp_used * sstride);
@@ -1657,6 +1669,7 @@ bool Glm5Model::fast_setup(std::string& err) {
         for (auto& sbuf : F->stage)
             if (cudaHostAlloc((void**) &sbuf, sstride, cudaHostAllocPortable) != cudaSuccess) {
                 err = "glm fast: pinned disk staging did not allocate";
+                tier_oom_ = true;
                 return false;
             }
         F->stage_bytes = sstride;
@@ -1740,6 +1753,8 @@ bool Glm5Model::fast_setup(std::string& err) {
             }
             return r;
         };
+        tier_try_b_ = 0;   // (what this part sets out to pin: its plan, at a split's share under a cap)
+        for (size_t c = 0; c < n_cls; ++c) tier_try_b_ += c_plan[c] * c_stride[c];
         glmfast::TierPin tp;
         const bool tier_ok = glmfast::pin_tier_classes(tp, c_plan, c_stride, c_least, later_b, reserve_b, measure_later,
                                                        pin, unpin, room);
@@ -1768,8 +1783,10 @@ bool Glm5Model::fast_setup(std::string& err) {
         }
         if (!tier_ok) {
             err = "glm fast: CUDA" + std::to_string(dev_) + " the pinned RAM tier did not allocate";
+            tier_oom_ = true;
             return false;
         }
+        tier_try_b_ = (int64_t) F->ram_bytes;
         // (an APU whose pool holds every expert keeps a staging-only tier: no expert is outside VRAM to hold)
         for (size_t c = 0; c < n_cls; ++c)
             if (F->ram_resident && !staging_only && tp.n[c] < cls_cap[c]) {
@@ -1890,10 +1907,11 @@ bool Glm5Model::fast_setup(std::string& err) {
                 return r;
             };
             glmfast::TierPin rp;
-            const bool ok = glmfast::pin_tier_classes(rp, to, c_stride, c_least, 0, keep, false, pin, unpin, room_retry, true);
             int64_t target = 0;
+            for (size_t c = 0; c < n_cls; ++c) target += to[c] * c_stride[c];
+            tier_try_b_ = target;
+            const bool ok = glmfast::pin_tier_classes(rp, to, c_stride, c_least, 0, keep, false, pin, unpin, room_retry, true);
             for (size_t c = 0; c < n_cls; ++c) {
-                target += to[c] * c_stride[c];
                 auto& R = F->rc[c];
                 if (cls_p[c] == nullptr) continue;
                 const int64_t n = rp.n[c];
@@ -1912,8 +1930,10 @@ bool Glm5Model::fast_setup(std::string& err) {
                       "warm-up ran out of memory: cudaHostAlloc refused class " + std::to_string(c) + " at its floor of " +
                       std::to_string(c < n_cls ? c_least[c] : 0) + " slots (RAM tier retry " + std::to_string(retry) +
                       " of " + std::to_string(glmfast::kWarmRetryMax) + ")";
+                tier_oom_ = true;
                 return false;
             }
+            tier_try_b_ = (int64_t) F->ram_bytes;
             if ((int64_t) F->ram_bytes < target)
                 std::fprintf(stderr, "glm fast: WARNING - CUDA%d the warm-up's retry pinned a %.2f GB RAM tier, under its "
                                      "%.2f GB target: the room under the pinning cap is short\n", dev_,
@@ -1952,6 +1972,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 warmed = fast_warm(err);
             }
             if (warmed) break;
+            tier_oom_ = glmfast::warm_oom_class(F->warm_cuda_err);   // (kept only if the start ends here)
             // another part failed meanwhile: this warm-up's own error (or its stop) ends the start, no retry
             if (split_load_ != nullptr && split_load_->aborted()) return false;
             std::vector<int64_t> have(n_cls), strd(n_cls);
@@ -1988,6 +2009,7 @@ bool Glm5Model::fast_setup(std::string& err) {
                 repinned = retier(to, retries + 1);
             }
             if (!repinned) return false;
+            tier_oom_ = false;
             ++retries;
             int64_t slots = 0;
             for (const auto& R : F->rc) slots += R.n;
