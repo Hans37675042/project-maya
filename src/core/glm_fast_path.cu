@@ -490,6 +490,24 @@ static int64_t pin_room(int64_t limit) {
     return got;
 }
 
+// Where a pinning cap applies - Windows, whose driver pins less than the free RAM (STRATA_GLM_PIN_CAP_MB simulates one
+// elsewhere) - a split's parts share the room under it: each GPU keeps kPinRoom above the tiers for its driver and the
+// split one more for its warm-ups (STRATA_GLM_RAM_GB=44 on two GPUs and 64 GB: the tiers pinned with at least 0.5 GB
+// still free, and both warmed tables' uploads failed; at 43, 1 GB more free, both started), every part pins its plan's
+// share of the room the first part measures (glmfast::pin_tier_classes), and no part warms up before all have pinned
+static bool pin_capped() {
+#ifdef _WIN32
+    return true;
+#else
+    return getenv("STRATA_GLM_PIN_CAP_MB") != nullptr;
+#endif
+}
+// a parallel split's record, part by part: the RAM tier it planned and its small pinned buffers (bytes), and the share
+// of its plan each later part pins - set by the first part that measures the room under a cap
+static std::vector<int64_t> split_plan, split_small;
+static double split_scale = 1.0;
+static bool split_measured = false;
+
 
 // a start-time upload of pageable host data through a pinned buffer of ours (the disk staging): a pageable copy needs
 // pinned buffers of the driver's own, and with the RAM tiers just under a pinning cap (Windows) the warmed tables'
@@ -1577,6 +1595,9 @@ bool Glm5Model::fast_setup(std::string& err) {
             cls_cap[c] = std::max<int64_t>(1, (int64_t) (cls_weight[c] / (double) cls_stride[c])) + 16;
             cls_n[c] = std::min<int64_t>(n, cls_cap[c]);
         }
+        // (the small pinned buffers below: the table updates', and the disk reads' staging)
+        const int64_t small_b = (int64_t) (FastState::kMaxUpd * (sizeof(int) + sizeof(unsigned long long)) +
+                                           (size_t) g.n_exp_used * sstride);
         // parallel load: take the planned size from the budget and let the next part plan; every part pins once all
         // have planned (a later part's measurement then sees no tier half pinned)
         if (split_load_ != nullptr) {
@@ -1587,11 +1608,24 @@ bool Glm5Model::fast_setup(std::string& err) {
                 remaining_layers -= n_moe;
             }
             unpinned += planned;
+            // the split's record of the plans (the first part to plan starts it: no later part reaches here before)
+            if (part_ == 0) {
+                split_plan.assign((size_t) n_parts_, 0);
+                split_small.assign((size_t) n_parts_, 0);
+                split_scale = 1.0;
+                split_measured = false;
+            }
+            if (split_plan.size() == (size_t) n_parts_) {
+                split_plan[(size_t) part_] = planned;
+                split_small[(size_t) part_] = small_b;
+            }
             split_load_->pass(part_);
             split_load_->wait(n_parts_);
             // ... and then pin one after another, in part order: near a pinning cap (Windows) parts pinning at once
             // raced for the room under it - a 2x RTX 3080 box's first part shrank to 13.1 of its planned 21.5 GB while
-            // the second pinned all of its 22.5 (#105).  In turn, only the part that reaches the cap gives way
+            // the second pinned all of its 22.5 (#105).  In turn, only the part that reaches the cap gives way - and
+            // under a cap (pin_capped) every part gives way alike: each pins its plan's share of the room the first
+            // part measures for all of them (below), so the last one is not left whatever the first ones did not take
             split_load_->wait_pin(part_);
         }
         // the small pinned buffers first - the table updates and the disk reads' staging (an expert a routed entry):
@@ -1612,79 +1646,130 @@ bool Glm5Model::fast_setup(std::string& err) {
                 return false;
             }
         F->stage_bytes = sstride;
-        // at a pinning cap's first refusal the room left under it is measured (pin_room), and from there on each class
-        // takes its planned share of what is left - less the room kept above the tier
-        int64_t pin_left = -1;
-        const auto share = [&](size_t c) {
-            int64_t planned = 0;
-            for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
-            const double f = (double) std::max<int64_t>(0, pin_left - (int64_t) kPinRoom) / (double) std::max<int64_t>(1, planned);
-            return (int64_t) (f * (double) cls_n[c]);
-        };
-        for (size_t c = 0; c < cls_stride.size() && wsum > 0; ++c) {
-            auto& R = F->rc[c];
-            R.stride = cls_stride[c];
-            int64_t n = cls_n[c];
-            const int64_t cap = cls_cap[c];
-            const int64_t least = std::min<int64_t>(16, cap);   // the floor, or the whole cap when that is smaller
-            if (pin_left >= 0) n = std::max(least, std::min(n, share(c)));
-            void* p = nullptr;
-            // a refusal near a pinning cap: the size measured (above), and should that be refused too, 1/32 less a
-            // try for the first four (a tier just over a cap loses ~3%, not the 12% of a 7/8 step), then 1/8 less
-            for (int tries = 0; n >= least; ++tries) {
-                if ((p = numa_pinned((size_t) n * R.stride)) != nullptr) {   // (over every socket: numa_pinned)
-                    R.registered = true;
-                    break;
+        // the classes one after another (glmfast::pin_tier_classes): at a pinning cap's first refusal the room left
+        // under it is measured (pin_room), and from there on each class takes its planned share of what is left - less
+        // the room kept above the tier, and beside the share of a split's later parts.  On one GPU, or without a cap,
+        // there are no later parts and the room kept is kPinRoom: the steps the tier always took
+        const bool capped = pin_capped();
+        const int64_t keep = glmfast::pin_room_kept((int64_t) kPinRoom, n_parts_, capped);
+        const bool split_cap = capped && split_load_ != nullptr && split_plan.size() == (size_t) n_parts_;
+        int64_t later_b = 0, reserve_b = keep;   // the later parts' tiers, and what stays pinnable beside all
+        if (split_cap) {
+            // (the later parts pin their small buffers before their tiers: the reserve holds those too)
+            const auto lr = glmfast::split_later(split_plan, split_small, part_, split_scale, keep);
+            later_b = lr.first;
+            reserve_b = lr.second;
+            if (split_scale < 1.0 && wsum > 0) {
+                int64_t was = 0, now = 0;
+                for (size_t c = 0; c < cls_n.size(); ++c) {
+                    was += cls_n[c] * (int64_t) cls_stride[c];
+                    cls_n[c] = glmfast::scaled_slots(cls_n[c], std::min<int64_t>(16, cls_cap[c]), split_scale);
+                    now += cls_n[c] * (int64_t) cls_stride[c];
                 }
-                if (pin_alloc(&p, (size_t) n * R.stride, cudaHostAllocPortable) == cudaSuccess) {
-                    // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and
-                    // with two tiers pinned right up to it the warmed tables' upload failed (#105).  512 MB more that
-                    // will not pin: a step less
-                    void* room = nullptr;
-                    if (pin_alloc(&room, kPinRoom, cudaHostAllocDefault) == cudaSuccess) {
-                        pin_free(room, kPinRoom);
-                        break;
-                    }
-                    cudaGetLastError();
-                    pin_free(p, (size_t) n * R.stride);
+                std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: the split's room holds %.0f%% of each part's plan - "
+                                     "the RAM tier %.2f of its %.2f GB\n", dev_, 100.0 * split_scale,
+                             (double) now / 1073741824.0, (double) was / 1073741824.0);
+            }
+        }
+        // (the first part measures the room for the later parts, once)
+        const bool measure_later = split_cap && !split_measured && part_ + 1 < n_parts_;
+        const size_t n_cls = wsum > 0 ? cls_stride.size() : 0;
+        std::vector<int64_t> c_plan(n_cls), c_stride(n_cls), c_least(n_cls);
+        for (size_t c = 0; c < n_cls; ++c) {
+            c_plan[c] = cls_n[c];
+            c_stride[c] = (int64_t) cls_stride[c];
+            c_least[c] = std::min<int64_t>(16, cls_cap[c]);   // the floor, or the whole cap when that is smaller
+        }
+        std::vector<void*> cls_p(n_cls, nullptr);
+        std::vector<char> cls_reg(n_cls, 0);
+        const auto pin = [&](size_t c, int64_t n) {
+            const size_t bytes = (size_t) n * cls_stride[c];
+            void* p = nullptr;
+            if ((p = numa_pinned(bytes)) != nullptr) {   // (over every socket: numa_pinned)
+                cls_p[c] = p;
+                cls_reg[c] = 1;
+                return true;
+            }
+            if (pin_alloc(&p, bytes, cudaHostAllocPortable) == cudaSuccess) {
+                // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and with
+                // two tiers pinned right up to it the warmed tables' upload failed (#105).  The room that will not
+                // pin: a step less
+                void* above = nullptr;
+                if (pin_alloc(&above, (size_t) keep, cudaHostAllocDefault) == cudaSuccess) {
+                    pin_free(above, (size_t) keep);
+                    cls_p[c] = p;
+                    cls_reg[c] = 0;
+                    return true;
                 }
                 cudaGetLastError();
-                p = nullptr;
-                if (pin_left < 0) {
-                    int64_t planned = 0;
-                    for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * (int64_t) cls_stride[k];
-                    pin_left = pin_room(planned + (int64_t) kPinRoom);
-                    const int64_t fit = share(c);
+                pin_free(p, bytes);
+            }
+            cudaGetLastError();
+            return false;
+        };
+        const auto unpin = [&](size_t c, int64_t n) {
+            if (cls_p[c] == nullptr) return;
+            if (cls_reg[c]) numa_pinned_free(cls_p[c], (size_t) n * cls_stride[c]);
+            else pin_free(cls_p[c], (size_t) n * cls_stride[c]);
+            cls_p[c] = nullptr;
+        };
+        const auto room = [&](int64_t limit, bool for_later) {
+            const int64_t r = pin_room(limit);
+            if (!for_later) {
+                if (later_b > 0)
+                    std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin, the RAM tier sized to its "
+                                         "share beside the later parts' %.2f GB\n", dev_, (double) r / 1073741824.0,
+                                 (double) later_b / 1073741824.0);
+                else
                     std::fprintf(stderr, "glm fast: CUDA%d a pinning cap: %.2f GB more pin, the RAM tier sized to it\n",
-                                 dev_, (double) pin_left / 1073741824.0);
-                    if (fit < n) {
-                        n = std::max(least, fit);
-                        continue;
-                    }
-                }
-                const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
-                n = (n > least && less < least) ? least : less;
+                                 dev_, (double) r / 1073741824.0);
             }
-            if (p != nullptr && pin_left >= 0) pin_left = std::max<int64_t>(0, pin_left - n * (int64_t) R.stride);
-            if (p == nullptr) {
-                err = "glm fast: the pinned RAM tier did not allocate";
-                return false;
-            }
-            // (an APU whose pool holds every expert keeps a staging-only tier: no expert is outside VRAM to hold)
-            if (F->ram_resident && !staging_only && n < cap) {
-                err = "glm fast: --glm-ram-resident: the RAM tier cannot hold every non-VRAM expert (class " +
-                      std::to_string(c) + ": " + std::to_string(n) + " of " + std::to_string(cap) +
-                      " slots pinned; raise MAYA_GLM_RAM_GB, its headroom, or lower --max-context)";
-                return false;
-            }
-            R.base = (uint8_t*) p;
+            return r;
+        };
+        glmfast::TierPin tp;
+        const bool tier_ok = glmfast::pin_tier_classes(tp, c_plan, c_stride, c_least, later_b, reserve_b, measure_later,
+                                                       pin, unpin, room);
+        if (tp.later_room >= 0)
+            std::fprintf(stderr, "glm fast: CUDA%d a split's pinning room: %.2f GB more pin beside this tier, the later "
+                                 "parts plan %.2f GB and %.2f GB stays free - %s\n", dev_,
+                         (double) tp.later_room / 1073741824.0, (double) later_b / 1073741824.0,
+                         (double) reserve_b / 1073741824.0,
+                         tp.repinned ? "short: this tier pinned again at its share" : "they fit");
+        if (split_cap && later_b > 0 && tp.later_measured) {
+            split_scale *= tp.later_scale;
+            split_measured = true;
+        }
+        for (size_t c = 0; c < n_cls; ++c) {
+            auto& R = F->rc[c];
+            R.stride = cls_stride[c];
+            if (cls_p[c] == nullptr) continue;
+            const int64_t n = tp.n[c];
+            R.registered = cls_reg[c] != 0;
+            R.base = (uint8_t*) cls_p[c];
             R.n = (int) n;
             R.key.assign((size_t) n, -1);
             R.st.assign((size_t) n, FastState::kRFree);
             R.tick.assign((size_t) n, 0);
             F->ram_bytes += (size_t) n * R.stride;
         }
+        if (!tier_ok) {
+            err = "glm fast: the pinned RAM tier did not allocate";
+            return false;
+        }
+        // (an APU whose pool holds every expert keeps a staging-only tier: no expert is outside VRAM to hold)
+        for (size_t c = 0; c < n_cls; ++c)
+            if (F->ram_resident && !staging_only && tp.n[c] < cls_cap[c]) {
+                err = "glm fast: --glm-ram-resident: the RAM tier cannot hold every non-VRAM expert (class " +
+                      std::to_string(c) + ": " + std::to_string(tp.n[c]) + " of " + std::to_string(cls_cap[c]) +
+                      " slots pinned; raise MAYA_GLM_RAM_GB, its headroom, or lower --max-context)";
+                return false;
+            }
         if (split_load_ != nullptr) split_load_->pass_pin(part_);
+        // ... and under a pinning cap no part warms its tiers up before every part has pinned its own: the second card
+        // of a split met the cap, freed its refused class and measured the room while the first card streamed its
+        // experts in - it found 0.00 GB to pin (where 13 GB pinned on the same PC without that refusal) and the start
+        // failed.  The parts then pin, measure and free with every card idle, as one GPU does
+        if (split_load_ != nullptr && capped) split_load_->wait_pin(n_parts_);
         if (split_load_ == nullptr && !staging_only && ram_budget_ < 0 && remaining >= 0) {
             remaining = std::max<int64_t>(0, remaining - (int64_t) F->ram_bytes);
             remaining_layers -= n_moe;

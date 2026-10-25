@@ -2,8 +2,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <utility>
+#include <vector>
 
 namespace strata::core::glmfast {
 
@@ -126,6 +128,122 @@ inline size_t pagefile_hint_gib(size_t commit_limit, size_t ram_total, size_t ke
 // more than there are experts (a complete pool has more slots than experts: the warm-up's order lists each once)
 inline int warm_pool_slots(bool unified, int slots, int experts, int spares) {
     return full_unified_pool(unified, slots, experts) ? experts : std::min(experts, std::max(0, slots - spares));
+}
+
+// A RAM tier's size classes pinned one after another under a pinning cap (Windows' driver pins less than the free RAM;
+// STRATA_GLM_PIN_CAP_MB simulates one).  The caller's three calls:
+//   pin(c, n)            pins n slots of class c and keeps them only while the room kept above the tier still pins
+//   unpin(c, n)          frees what pin(c, n) kept
+//   room(limit, later)   how much more pins now, up to `limit` bytes (probes, freed again); later: the probe of a
+//                        split's later parts, not one after a refusal
+// planned/stride/least: a class's planned slots, its slot bytes and the floor it never goes under.  later: the tier
+// bytes a split's later parts plan to pin after this one (0 on one GPU); reserve: the bytes that must stay pinnable
+// beside all the tiers (the room kept above them, and the later parts' small pinned buffers).
+// At the first refusal the room is measured and each class takes its planned share of it - its share beside the later
+// parts' tiers too: the part that meets the cap first then leaves the later ones their share, not what happens to be
+// left (a split's first card on 64 GB of Windows pinned its whole 30.8 GB plan and its second card found 0.00 GB).
+// measure_later (once a split, on its first part): when no refusal measured the room, it is measured after the tier
+// for the later parts, and a tier that leaves them short is pinned again at its share.  Each class of one GPU (later
+// 0, the reserve the room kept above it) keeps exactly the steps it always had.
+struct TierPin {
+    std::vector<int64_t> n;       // the slots each class got (n[c] 0: class c did not pin, the start fails)
+    int64_t pin_left = -1;        // the room measured under the cap less the classes pinned since (-1: none measured)
+    int64_t later_room = -1;      // what the later parts' probe found (-1: no probe)
+    bool later_measured = false;  // later_scale comes from a measurement
+    bool repinned = false;        // the tier was pinned again at its share
+    double later_scale = 1.0;     // the share of their plans the later parts have room for
+};
+constexpr int64_t kPinProbeStep = int64_t{256} << 20;   // pin_room's smallest probe
+template <class Pin, class Unpin, class Room>
+inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, const std::vector<int64_t>& stride,
+                             const std::vector<int64_t>& least, int64_t later, int64_t reserve, bool measure_later,
+                             Pin pin, Unpin unpin, Room room) {
+    const size_t C = planned.size();
+    later = std::max<int64_t>(0, later);
+    const auto rest_of = [&](size_t c) {   // the planned bytes from class c on, the later parts' with them
+        int64_t rest = later;
+        for (size_t k = c; k < C; ++k) rest += planned[k] * stride[k];
+        return rest;
+    };
+    const auto share = [&](size_t c) {
+        const double f = (double) std::max<int64_t>(0, out.pin_left - reserve) / (double) std::max<int64_t>(1, rest_of(c));
+        return (int64_t) (f * (double) planned[c]);
+    };
+    const auto run = [&]() {
+        out.n.assign(C, 0);
+        for (size_t c = 0; c < C; ++c) {
+            int64_t n = planned[c];
+            const int64_t lo = least[c];
+            if (out.pin_left >= 0) n = std::max(lo, std::min(n, share(c)));
+            bool ok = false;
+            // a refusal near a pinning cap: the size measured, and should that be refused too, 1/32 less a try for
+            // the first four (a tier just over a cap loses ~3%, not the 12% of a 7/8 step), then 1/8 less
+            for (int tries = 0; n >= lo; ++tries) {
+                if (pin(c, n)) {
+                    ok = true;
+                    break;
+                }
+                if (out.pin_left < 0) {
+                    out.pin_left = room(rest_of(c) + reserve, false);
+                    const int64_t fit = share(c);
+                    if (fit < n) {
+                        n = std::max(lo, fit);
+                        continue;
+                    }
+                }
+                const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
+                n = (n > lo && less < lo) ? lo : less;
+            }
+            if (!ok) return false;
+            out.n[c] = n;
+            if (out.pin_left >= 0) out.pin_left = std::max<int64_t>(0, out.pin_left - n * stride[c]);
+        }
+        return true;
+    };
+    if (!run()) return false;
+    if (later <= 0) return true;
+    if (out.pin_left < 0 && measure_later) {
+        // (rounded up to the probes' step: room that pins all of it then reads as all of it)
+        const int64_t need = (later + reserve + kPinProbeStep - 1) / kPinProbeStep * kPinProbeStep;
+        const int64_t r = room(need, true);
+        out.later_room = r;
+        out.later_measured = true;
+        if (r >= need) return true;
+        // this tier leaves the later parts short: it goes, and pins again at its share of the room both have
+        int64_t own = 0;
+        for (size_t c = 0; c < C; ++c) own += out.n[c] * stride[c];
+        for (size_t c = 0; c < C; ++c) unpin(c, out.n[c]);
+        out.pin_left = own + r;
+        out.repinned = true;
+        if (!run()) return false;
+    }
+    if (out.pin_left >= 0) {
+        out.later_scale = std::min(1.0, std::max(0.0, (double) (out.pin_left - reserve) / (double) later));
+        out.later_measured = true;
+    }
+    return true;
+}
+
+// The room kept pinnable above the RAM tiers (`room` a GPU): one GPU's, or under a pinning cap one for each GPU of a
+// split and one more for their warm-ups, which run at once
+inline int64_t pin_room_kept(int64_t room, int n_parts, bool capped) {
+    return room * (capped && n_parts > 1 ? n_parts + 1 : 1);
+}
+// What a split's part `part` pins beside: its later parts' tiers - their plans (bytes) at the split's scale - and the
+// bytes that must stay pinnable beside every tier: the room kept, and the later parts' small pinned buffers.
+// {later, reserve}
+inline std::pair<int64_t, int64_t> split_later(const std::vector<int64_t>& plan, const std::vector<int64_t>& small,
+                                               int part, double scale, int64_t keep) {
+    int64_t later = 0, reserve = keep;
+    for (size_t j = (size_t) std::max(0, part + 1); j < plan.size() && j < small.size(); ++j) {
+        later += plan[j];
+        reserve += small[j];
+    }
+    return {(int64_t) ((double) later * scale), reserve};
+}
+// a class's planned slots at the split's scale, never under its floor
+inline int64_t scaled_slots(int64_t n, int64_t least, double scale) {
+    return scale < 1.0 ? std::max(least, (int64_t) ((double) n * scale)) : n;
 }
 
 }  // namespace strata::core::glmfast
