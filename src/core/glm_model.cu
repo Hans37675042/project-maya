@@ -1251,7 +1251,7 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         std::vector<std::unique_ptr<Glm5Model>> owned((size_t) n);
         std::vector<Glm5Model*> parts((size_t) n, this);
         for (int i = 1; i < n; ++i) owned[(size_t) i].reset(new Glm5Model()), parts[(size_t) i] = owned[(size_t) i].get();
-        SplitLoad sl(n);
+        glmfast::SplitSync sl(n);
         std::vector<std::string> errs((size_t) n);
         std::vector<char> ok((size_t) n, 0);
         std::vector<std::thread> th;
@@ -1268,8 +1268,9 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             p->head_half_ = i == helper;
             th.emplace_back([&, i, l0, l1, p] {
                 ok[(size_t) i] = p->load_pack(pack_dir, max_ctx, errs[(size_t) i], devs[(size_t) i], l0, l1);
-                sl.pass(i);       // (a part that stopped early, or never reached those turns, lets the others on)
-                sl.pass_pin(i);
+                // (a failure aborts the others' start; a part that stopped early, or never reached those turns, lets
+                // the others on)
+                sl.finish(i, ok[(size_t) i] != 0);
             });
         }
         for (auto& t : th) t.join();
@@ -1277,11 +1278,21 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
             parts[(size_t) i]->split_load_ = nullptr;
             parts[(size_t) i]->defer_lane_ = false;
         }
-        for (int i = 0; i < n; ++i)
-            if (!ok[(size_t) i]) {
-                err = errs[(size_t) i];
-                return false;
-            }
+        // the start ends with the error of the part that failed first (the others stopped on it, or failed after it:
+        // theirs follow) - a refused pin on the second card stopped the first one's warm-up, whose out of memory used
+        // to stand for it
+        // (short of pinned memory first: the line with every part's tier, planned or pinned - the launcher's size)
+        std::vector<glmfast::SplitPartEnd> ends((size_t) n);
+        for (int i = 0; i < n; ++i) {
+            const Glm5Model* p = parts[(size_t) i];
+            ends[(size_t) i] = {ok[(size_t) i] != 0, errs[(size_t) i], p->tier_try_b_, p->tier_manual_, p->tier_oom_};
+        }
+        const glmfast::SplitStartEnd end = glmfast::split_start_end(sl.failures(), ends);
+        if (end.failed) {
+            err = end.err;
+            if (!end.oom_line.empty()) std::fprintf(stderr, "%s\n", end.oom_line.c_str());
+            return false;
+        }
         for (int i = n - 1; i >= 1; --i) parts[(size_t) i - 1]->split_next_ = std::move(owned[(size_t) i]);
         if (helper > 0 && parts[(size_t) helper]->head_half_ && !parts[(size_t) n - 1]->head_split_link(parts[(size_t) helper], err)) {
             split_next_.reset();
@@ -1313,6 +1324,13 @@ bool Glm5Model::load_pack_split(const std::string& pack_dir, int64_t max_ctx, co
         m->profile_path_ = profile_path_;   // every part reads the same profile
         m->head_half_ = i == helper;
         if (!m->load_pack(pack_dir, max_ctx, err, devs[(size_t) i], l0, l1)) {
+            // (the line with the tiers of the parts loaded and this one's: the sequential load's total stops at the
+            // failing part - the parts after it never started, their tiers are not in it)
+            std::vector<glmfast::SplitPartEnd> ends;
+            for (const Glm5Model* p = this; p != nullptr; p = p == m ? nullptr : p->split_next_.get())
+                ends.push_back({p != m, p == m ? err : std::string(), p->tier_try_b_, p->tier_manual_, p->tier_oom_});
+            const glmfast::SplitStartEnd end = glmfast::split_start_end({}, ends);
+            if (!end.oom_line.empty()) std::fprintf(stderr, "%s\n", end.oom_line.c_str());
             if (prev != nullptr) prev->split_next_.reset();
             return false;
         }
@@ -2815,6 +2833,10 @@ void strata::core::Glm5Model::pack_release_views() {
 
 bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max_ctx, std::string& err, int dev,
                                         int l0, int l1) {
+    // a parallel split: a failure anywhere below aborts the other parts' start at once (glmfast::SplitFailOnExit), and
+    // this part stops at its next phase when another part failed (split_aborted: split_stop - not a failure of its own)
+    glmfast::SplitFailOnExit fail_on_exit(split_load_, part_);
+    const auto split_aborted = [&] { return split_load_ != nullptr && split_load_->aborted(); };
     dev_ = dev;
     pack_dir_ = pack_dir;
     cudaSetDevice(dev_);
@@ -2871,6 +2893,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         return -1;
     };
 
+    if (split_aborted()) return split_stop(err);
     // 3. native_experts.txt: per MoE layer, the expert types and blob offsets
     pack_layers_.assign((size_t) g_.n_layers, NativeLayer{});
     {
@@ -2992,6 +3015,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
 
+    if (split_aborted()) return split_stop(err);
     // 4. the dense tensors: dequantize everything into the F32 device arena.  F32 rows come
     //    straight out of dense.bin; every other kind (BF16 rows and the natively-served
     //    quantized rows) is resolved through the GGUF shards and dequantized by ggml's traits.
@@ -3316,6 +3340,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                              "reads both halves at once\n", dev_, c0, m.n, (double) (run_b * (m.k / 16)) / 1048576.0);
     }
 
+    if (split_aborted()) return split_stop(err);
     // 4b. the NextN (MTP) block on the LAST half of the fast path: its own weights from the shards (the pack never
     //     carried blk.<n_layers>.*), its experts through the tiers like any MoE layer
     lt_ = l1_;
@@ -3353,6 +3378,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         if (mtp_il_ >= 0 && mtp_one) mtp_vocab_scan(gfs);   // the draft head's vocabulary
     }
 
+    if (split_aborted()) return split_stop(err);
     // 5. the router bias, host-side: the prefetch ranks the next-best experts per layer, and the
     //    ranking needs sigmoid(logits) + this per-layer bias (device-side it stays as it was)
     host_probs_b_.assign((size_t) g_.n_layers * g_.n_expert, 0.0f);
@@ -3363,6 +3389,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
                        (size_t) g_.n_expert * sizeof(float), cudaMemcpyDeviceToHost);
     }
 
+    if (split_aborted()) return split_stop(err);
     // 6. the state and scratch arenas (identical to load()), then the CPU MoE buffers
     const int64_t hc_dim = (int64_t) g_.hc * g_.n_embd;
     const int64_t max_pools = max_ctx / g_.idx_kpool;
@@ -3484,6 +3511,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         }
     }
 
+    if (split_aborted()) return split_stop(err);
     // 6. the device expert pool (M2b): uniform slots sized for the largest per-layer blob, filled
     //    on miss straight from the mmap'd shards, LRU residency.  The grouped kernels read a
     //    host-mapped plan (UVA), so a token needs no plan copies.  STRATA_GLM_CPU_EXPERTS forces
@@ -3608,6 +3636,7 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
     pack_ = true;
     loaded_ = true;
     if (fast_mode_) pack_release_views();   // before fast_setup: its RAM tier sees the embedding's heap copy
+    if (split_aborted()) return split_stop(err);
     // a DFlash drafter on the part with the head: its weights and ring before the expert pool is sized
     dflash_on_ = fast_mode_ && !dflash_path_.empty();
     if (!dflash_path_.empty() && l1_ == g_.n_layers) {
@@ -3616,8 +3645,14 @@ bool strata::core::Glm5Model::load_pack(const std::string& pack_dir, int64_t max
         else if (!dflash_load(dflash_path_, dev_, err))
             return false;
     }
-    if (fast_mode_ && !fast_setup(err)) return false;
+    if (split_aborted()) return split_stop(err);
+    if (fast_mode_ && !fast_setup(err)) {
+        // (a parallel split's part: fail_on_exit aborts the others now, before their own errors; a split's line: its load)
+        if (split_load_ == nullptr && n_parts_ <= 1 && tier_oom_) tier_oom_report(tier_try_b_, tier_manual_);
+        return false;
+    }
     reset();
+    fail_on_exit.dismiss();
     return true;
 }
 

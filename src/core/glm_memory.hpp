@@ -1,9 +1,16 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstddef>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace strata::core::glmfast {
 
@@ -126,6 +133,474 @@ inline size_t pagefile_hint_gib(size_t commit_limit, size_t ram_total, size_t ke
 // more than there are experts (a complete pool has more slots than experts: the warm-up's order lists each once)
 inline int warm_pool_slots(bool unified, int slots, int experts, int spares) {
     return full_unified_pool(unified, slots, experts) ? experts : std::min(experts, std::max(0, slots - spares));
+}
+
+// A RAM tier's size classes pinned one after another under a pinning cap (Windows' driver pins less than the free RAM;
+// STRATA_GLM_PIN_CAP_MB simulates one).  The caller's three calls:
+//   pin(c, n)            pins n slots of class c and keeps them only while the room kept above the tier still pins
+//   unpin(c, n)          frees what pin(c, n) kept
+//   room(limit, later)   how much more pins now, up to `limit` bytes (probes, freed again); later: the probe of a
+//                        split's later parts, not one after a refusal
+// planned/stride/least: a class's planned slots, its slot bytes and the floor it never goes under.  later: the tier
+// bytes a split's later parts plan to pin after this one (0 on one GPU); reserve: the bytes that must stay pinnable
+// beside all the tiers (the room kept above them, and the later parts' small pinned buffers).
+// At the first refusal the room is measured and each class takes its planned share of it - its share beside the later
+// parts' tiers too: the part that meets the cap first then leaves the later ones their share, not what happens to be
+// left (a split's first card on 64 GB of Windows pinned its whole 30.8 GB plan and its second card found 0.00 GB).
+// measure_later (once a split, on its first part): when no refusal measured the room, it is measured after the tier
+// for the later parts, and a tier that leaves them short is pinned again at its share.  Each class of one GPU (later
+// 0, the reserve the room kept above it) keeps exactly the steps it always had.
+// A split's part (later > 0, or a reserve over one GPU's room: "guarded") also keeps the floors: a class that pins
+// before any refusal must leave the floors of the classes after it and of the later parts (and the reserve) still
+// pinnable, or it is unpinned and takes its share of the measured room; and a share is the floor plus its part of
+// what is left beyond all the floors, so a cap that holds every floor gives every class of every part its floor.
+// (The later parts' floors are estimated from this part's: its floors for each multiple of its plan they plan.)
+// guard: guarded whatever the later parts and the reserve - a warm-up retry's re-pin (fast_setup's retier), which pins
+// near a limit just met and must leave each class after the one pinning its floor, on one GPU too.
+struct TierPin {
+    std::vector<int64_t> n;       // the slots each class got (n[c] 0: class c did not pin, the start fails)
+    int64_t pin_left = -1;        // the room measured under the cap less the classes pinned since (-1: none measured)
+    int64_t later_room = -1;      // what the later parts' probe found (-1: no probe)
+    bool later_measured = false;  // later_scale comes from a measurement
+    bool repinned = false;        // the tier was pinned again at its share
+    double later_scale = 1.0;     // the share of their plans the later parts have room for
+};
+constexpr int64_t kPinProbeStep = int64_t{256} << 20;   // pin_room's smallest probe
+constexpr int64_t kPinRoomOneGpu = int64_t{512} << 20;   // kPinRoom (glm_fast_path.cu): the room one GPU keeps above its tier
+template <class Pin, class Unpin, class Room>
+inline bool pin_tier_classes(TierPin& out, const std::vector<int64_t>& planned, const std::vector<int64_t>& stride,
+                             const std::vector<int64_t>& least, int64_t later, int64_t reserve, bool measure_later,
+                             Pin pin, Unpin unpin, Room room, bool guard = false) {
+    const size_t C = planned.size();
+    later = std::max<int64_t>(0, later);
+    const auto rest_of = [&](size_t c) {   // the planned bytes from class c on, the later parts' with them
+        int64_t rest = later;
+        for (size_t k = c; k < C; ++k) rest += planned[k] * stride[k];
+        return rest;
+    };
+    // a split's part (see above); one GPU, and a split without a cap, are not: their steps are v1.1.20's
+    const bool guarded = guard || later > 0 || reserve > kPinRoomOneGpu;
+    int64_t own_least = 0, own_plan = 0;   // this part's floors and plan, bytes
+    for (size_t k = 0; k < C; ++k) {
+        own_least += least[k] * stride[k];
+        own_plan += planned[k] * stride[k];
+    }
+    const int64_t later_least =
+        later > 0 ? std::min(later, own_least * ((later + std::max<int64_t>(1, own_plan) - 1) / std::max<int64_t>(1, own_plan))) : 0;
+    const auto least_from = [&](size_t c) {   // the floors, in bytes, of the classes from class c on
+        int64_t b = 0;
+        for (size_t k = c; k < C; ++k) b += least[k] * stride[k];
+        return b;
+    };
+    const auto share = [&](size_t c) {
+        if (guarded) {   // the floor, and its part of the room beyond every floor (the later parts' with them)
+            int64_t extra = later - later_least;
+            for (size_t k = c; k < C; ++k) extra += std::max<int64_t>(0, planned[k] - least[k]) * stride[k];
+            const int64_t spare = out.pin_left - reserve - least_from(c) - later_least;
+            const double f = spare > 0 ? std::min(1.0, (double) spare / (double) std::max<int64_t>(1, extra)) : 0.0;
+            return least[c] + (int64_t) (f * (double) std::max<int64_t>(0, planned[c] - least[c]));
+        }
+        const double f = (double) std::max<int64_t>(0, out.pin_left - reserve) / (double) std::max<int64_t>(1, rest_of(c));
+        return (int64_t) (f * (double) planned[c]);
+    };
+    const auto run = [&]() {
+        out.n.assign(C, 0);
+        for (size_t c = 0; c < C; ++c) {
+            int64_t n = planned[c];
+            const int64_t lo = least[c];
+            if (out.pin_left >= 0) n = std::max(lo, std::min(n, share(c)));
+            bool ok = false;
+            // a refusal near a pinning cap: the size measured, and should that be refused too, 1/32 less a try for
+            // the first four (a tier just over a cap loses ~3%, not the 12% of a 7/8 step), then 1/8 less
+            for (int tries = 0; n >= lo; ++tries) {
+                bool pinned = pin(c, n), held_back = false;
+                if (pinned && guarded && out.pin_left < 0) {
+                    // before any refusal: what is left must still pin the floors after this class, the reserve, and
+                    // (but the first part, whose probe after the tier measures the later parts) the later parts' floors
+                    const int64_t need = least_from(c + 1) + (measure_later ? 0 : later_least) + reserve;
+                    if (room((need + kPinProbeStep - 1) / kPinProbeStep * kPinProbeStep, true) < need) {
+                        unpin(c, n);
+                        pinned = false;
+                        held_back = true;
+                    }
+                }
+                if (pinned) {
+                    ok = true;
+                    break;
+                }
+                if (out.pin_left < 0) {
+                    out.pin_left = room(rest_of(c) + reserve, false);
+                    const int64_t fit = share(c);
+                    if (fit < n) {
+                        n = std::max(lo, fit);
+                        continue;
+                    }
+                    if (held_back) continue;   // (the room is measured now: the same size pins in its share)
+                }
+                const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
+                n = (n > lo && less < lo) ? lo : less;
+            }
+            if (!ok) return false;
+            out.n[c] = n;
+            if (out.pin_left >= 0) out.pin_left = std::max<int64_t>(0, out.pin_left - n * stride[c]);
+        }
+        return true;
+    };
+    if (!run()) return false;
+    if (later <= 0) return true;
+    if (out.pin_left < 0 && measure_later) {
+        // (rounded up to the probes' step: room that pins all of it then reads as all of it)
+        const int64_t need = (later + reserve + kPinProbeStep - 1) / kPinProbeStep * kPinProbeStep;
+        const int64_t r = room(need, true);
+        out.later_room = r;
+        out.later_measured = true;
+        if (r >= need) return true;
+        // this tier leaves the later parts short: it goes, and pins again at its share of the room both have
+        int64_t own = 0;
+        for (size_t c = 0; c < C; ++c) own += out.n[c] * stride[c];
+        for (size_t c = 0; c < C; ++c) unpin(c, out.n[c]);
+        out.pin_left = own + r;
+        out.repinned = true;
+        if (!run()) return false;
+    }
+    if (guarded && later > 0 && !out.repinned && out.pin_left >= 0 && out.pin_left - reserve < later_least) {
+        // a refusal measured the room, but this tier left the later parts under their floors: pin again at its share
+        int64_t own = 0;
+        for (size_t c = 0; c < C; ++c) own += out.n[c] * stride[c];
+        for (size_t c = 0; c < C; ++c) unpin(c, out.n[c]);
+        out.pin_left += own;
+        out.repinned = true;
+        if (!run()) return false;
+    }
+    if (out.pin_left >= 0) {
+        out.later_scale = std::min(1.0, std::max(0.0, (double) (out.pin_left - reserve) / (double) later));
+        out.later_measured = true;
+    }
+    return true;
+}
+
+// The room kept pinnable above the RAM tiers (`room` a GPU): one GPU's, or under a pinning cap one for each GPU of a
+// split and one more for their warm-ups, which run at once
+inline int64_t pin_room_kept(int64_t room, int n_parts, bool capped) {
+    return room * (capped && n_parts > 1 ? n_parts + 1 : 1);
+}
+// What a split's part `part` pins beside: its later parts' tiers - their plans (bytes) at the split's scale - and the
+// bytes that must stay pinnable beside every tier: the room kept, and the later parts' small pinned buffers.
+// {later, reserve}
+inline std::pair<int64_t, int64_t> split_later(const std::vector<int64_t>& plan, const std::vector<int64_t>& small,
+                                               int part, double scale, int64_t keep) {
+    int64_t later = 0, reserve = keep;
+    for (size_t j = (size_t) std::max(0, part + 1); j < plan.size() && j < small.size(); ++j) {
+        later += plan[j];
+        reserve += small[j];
+    }
+    return {(int64_t) ((double) later * scale), reserve};
+}
+// a class's planned slots at the split's scale, never under its floor
+inline int64_t scaled_slots(int64_t n, int64_t least, double scale) {
+    return scale < 1.0 ? std::max(least, (int64_t) ((double) n * scale)) : n;
+}
+
+// A warm-up that runs out of memory (a copy or the tables' upload answers "out of memory" when the RAM tier is pinned
+// too near what the driver and Windows can still lock for their own buffers): a RAM tier SIZED BY THE ENGINE gives
+// some of its slots back and the warm-up runs again - at most kWarmRetryMax times, each a step smaller.  A size the user
+// set (STRATA_GLM_RAM_GB) is theirs: that start fails with the error, as it always did.
+constexpr int kWarmRetryMax = 4;
+constexpr int kCudaOutOfMemory = 2;   // cudaErrorMemoryAllocation, and hipErrorOutOfMemory
+inline bool warm_oom_class(int code) {
+    return code == kCudaOutOfMemory;
+}
+// The slots each class of the RAM tier keeps for the next try, after `tries` retries already ran (n, stride and least:
+// the classes' pinned slots, slot bytes and floors) - empty: no retry (a manual size, another error, out of tries, or
+// the tier is at its floors).  The step is 1 GiB or 5% of the tier, whichever is more; what a class holds above its
+// floor shrinks by one common factor, so the floors are reached together and never passed.  Every retry is smaller.
+inline std::vector<int64_t> warm_retry_slots(bool auto_sized, int code, int tries, const std::vector<int64_t>& n,
+                                             const std::vector<int64_t>& stride, const std::vector<int64_t>& least) {
+    const size_t C = n.size();
+    if (!auto_sized || !warm_oom_class(code) || tries >= kWarmRetryMax || stride.size() != C || least.size() != C)
+        return {};
+    int64_t have = 0, floor_b = 0;
+    std::vector<int64_t> keep(C);   // a class's floor (or all of it, where it holds less)
+    for (size_t c = 0; c < C; ++c) {
+        keep[c] = std::max<int64_t>(0, std::min(n[c], least[c]));   // (a negative floor is 0: no class goes under 0)
+        have += n[c] * stride[c];
+        floor_b += keep[c] * stride[c];
+    }
+    if (have <= floor_b) return {};
+    const int64_t step = std::max<int64_t>(int64_t{1} << 30, have / 20);
+    const int64_t target = std::max(floor_b, have - step);
+    const double f = (double) (target - floor_b) / (double) (have - floor_b);
+    std::vector<int64_t> out(C);
+    bool less = false;
+    for (size_t c = 0; c < C; ++c) {
+        out[c] = keep[c] + (int64_t) ((double) (n[c] - keep[c]) * f);
+        less = less || out[c] < n[c];
+    }
+    if (!less) {   // (a step under one slot of any class: the biggest class above its floor gives one up)
+        size_t b = C;
+        for (size_t c = 0; c < C; ++c)
+            if (out[c] > keep[c] && (b == C || (out[c] - keep[c]) * stride[c] > (out[b] - keep[b]) * stride[b])) b = c;
+        if (b == C) return {};
+        --out[b];
+    }
+    return out;
+}
+// How a part's RAM tier was sized (fast_setup), from one place: `manual` - its size was not the engine's own choice
+// (STRATA_GLM_RAM_GB, the API's budget, a RAM-resident tier): the RAM-TIER-OOM line's manual=1, which the launcher does
+// not restart from; `auto_sized` - a warm-up out of memory may shrink it in-engine (warm_retry_slots).  A staging-only
+// tier (minimal_ram_tier: every expert fits in the pool) is the engine's own choice - not manual, its size still counts
+// in the line's total - but it is at its floors already, so it never shrinks in-engine either
+struct RamTierSizing {
+    bool manual = false;
+    bool auto_sized = false;
+};
+inline RamTierSizing ram_tier_sizing(bool staging_only, bool fixed_ram, bool budget_set, bool ram_resident) {
+    const bool manual = fixed_ram || budget_set || ram_resident;
+    return {manual, !manual && !staging_only};
+}
+
+// A split's warm-ups and their retries' re-pins (fast_setup).  The parts warm up at once, but a part whose warm-up ran
+// out of memory pins its smaller tier again only while no other part warms up or re-pins: the room under a pinning
+// cap read while another card streamed its experts in came to 0.00 GB (why every part waits at wait_pin before its
+// first warm-up), and a re-pin near the cap can take the pinned buffers another card's copy needs.  A warm-up is a
+// shared turn, a re-pin an exclusive one:
+//   - a part asks for a re-pin only once its own warm-up has ended (end_warm), and while it waits it holds no turn:
+//     two parts retrying at once take turns, neither waits on the other's warm-up or re-pin
+//   - a re-pin asked for goes before every warm-up not yet begun (the ones running end; none starts past it), so the
+//     re-pin is not held off by the other parts' next warm-ups
+//   - one GPU (no split) never takes the gate: its path has no wait at all
+//   - an aborted split (a part failed, SplitSync::fail): every waiter wakes without a turn, and no turn is given after -
+//     a begin_ returns false then.  A turn already held runs on and is given back as before
+class WarmGate {
+public:
+    bool begin_warm() {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return aborted_ || (!repinning_ && repin_asked_ == 0); });
+        if (aborted_) return false;
+        ++warming_;
+        return true;
+    }
+    void end_warm() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            --warming_;
+        }
+        cv_.notify_all();
+    }
+    bool begin_repin() {
+        std::unique_lock<std::mutex> lk(mu_);
+        ++repin_asked_;
+        cv_.wait(lk, [&] { return aborted_ || (!repinning_ && warming_ == 0); });
+        --repin_asked_;
+        if (aborted_) return false;
+        repinning_ = true;
+        return true;
+    }
+    void end_repin() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            repinning_ = false;
+        }
+        cv_.notify_all();
+    }
+    void abort() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            aborted_ = true;
+        }
+        cv_.notify_all();
+    }
+    // (test-only: the engine never calls it - it reads SplitSync::aborted, and a begin_ that returns false)
+    bool aborted() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return aborted_;
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    int warming_ = 0;       // the parts warming up now
+    int repin_asked_ = 0;   // the parts waiting for their re-pin's turn
+    bool repinning_ = false;
+    bool aborted_ = false;
+};
+// a turn of a WarmGate, given back however its scope ends (gate nullptr: none - one GPU).  ok(): the turn was taken
+// (false: the split was aborted - nothing to give back)
+class WarmTurn {
+public:
+    WarmTurn(WarmGate* gate, bool repin) : gate_(gate), repin_(repin) {
+        if (gate_ != nullptr) held_ = repin_ ? gate_->begin_repin() : gate_->begin_warm();
+    }
+    ~WarmTurn() {
+        if (gate_ != nullptr && held_) repin_ ? gate_->end_repin() : gate_->end_warm();
+    }
+    bool ok() const { return gate_ == nullptr || held_; }
+    WarmTurn(const WarmTurn&) = delete;
+    WarmTurn& operator=(const WarmTurn&) = delete;
+
+private:
+    WarmGate* gate_;
+    bool repin_;
+    bool held_ = false;
+};
+
+// A parallel split load's turns (glm_model.cu's load_pack_split, fast_setup): the parts take the RAM budget in part
+// order (wait / pass), then pin their RAM tiers in part order too (wait_pin / pass_pin), and warm up under `gate`.
+// A part that fails (fail) aborts the split: every wait here and at the gate wakes and returns false, and the parts
+// still loading stop instead of warming up or retrying - a 2-GPU start whose second card's pin was refused had the
+// first card warm up, run out of memory and report that instead, and CUDA1's "did not allocate" went unseen.  A part
+// that stops because of the abort says so (stopped): failures() keeps the parts that failed of their own, the earliest
+// first.  Every part's thread ends with finish(), which passes its turns however it ended (a part that never reached
+// them lets the others on)
+class SplitSync {
+public:
+    explicit SplitSync(int n) : passed_((size_t) std::max(0, n), false), pinned_((size_t) std::max(0, n), false),
+                                stopped_((size_t) std::max(0, n), false) {}
+    int parts() const { return (int) passed_.size(); }
+    // wait for the turn of `part` (parts: all have passed); false: the split was aborted
+    bool wait(int part) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return aborted_ || turn_ >= part; });
+        return !aborted_;
+    }
+    void pass(int part) { mark(passed_, turn_, part); }
+    bool wait_pin(int part) {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [&] { return aborted_ || pin_turn_ >= part; });
+        return !aborted_;
+    }
+    void pass_pin(int part) { mark(pinned_, pin_turn_, part); }
+    // `part` failed: the split is aborted (the gate first: a part that reads aborted() true finds no turn there)
+    void fail(int part) {
+        gate.abort();
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            const bool own = part >= 0 && part < parts() && !stopped_[(size_t) part];
+            if (own && std::find(failed_.begin(), failed_.end(), part) == failed_.end()) failed_.push_back(part);
+            aborted_ = true;
+            aborted_flag_.store(true);
+        }
+        cv_.notify_all();
+    }
+    // `part` stops because the split was aborted: its end (finish(part, false)) is no failure of its own
+    void stopped(int part) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (part >= 0 && part < parts()) stopped_[(size_t) part] = true;
+    }
+    // a part's thread ends: a failure aborts, and its turns pass whatever it reached
+    void finish(int part, bool ok) {
+        if (!ok) fail(part);
+        pass(part);
+        pass_pin(part);
+    }
+    bool aborted() const { return aborted_flag_.load(); }
+    std::vector<int> failures() {
+        std::lock_guard<std::mutex> lk(mu_);
+        return failed_;
+    }
+    WarmGate gate;   // the warm-ups and their retries' re-pins
+
+private:
+    void mark(std::vector<bool>& done, int& turn, int part) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            if (part >= 0 && part < parts()) done[(size_t) part] = true;
+            while (turn < parts() && done[(size_t) turn]) ++turn;
+        }
+        cv_.notify_all();
+    }
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::vector<bool> passed_, pinned_, stopped_;
+    std::vector<int> failed_;   // the parts that failed of their own, in order
+    int turn_ = 0, pin_turn_ = 0;
+    bool aborted_ = false;
+    std::atomic<bool> aborted_flag_{false};   // (aborted_, read without the lock: a warm-up's poll)
+};
+
+// A split part's load (load_pack) that ends anywhere but its success aborts the split there and then (SplitSync::fail):
+// a part failing before its RAM tier (the VRAM pool, the drafter, a file read, the sampler buffer) used to say so only
+// when its thread ended, and the other parts loaded all their weights first.  They now stop at their next turn or
+// phase boundary.  dismiss(): the load succeeded.  nullptr: one GPU or the sequential split - nothing to abort.  A part
+// that stopped on another's abort (SplitSync::stopped) is not recorded as failed
+class SplitFailOnExit {
+public:
+    SplitFailOnExit(SplitSync* s, int part) : s_(s), part_(part) {}
+    ~SplitFailOnExit() {
+        if (s_ != nullptr) s_->fail(part_);
+    }
+    void dismiss() { s_ = nullptr; }
+    SplitFailOnExit(const SplitFailOnExit&) = delete;
+    SplitFailOnExit& operator=(const SplitFailOnExit&) = delete;
+
+private:
+    SplitSync* s_;
+    int part_;
+};
+
+// The start's line when it failed for want of pinned memory - a RAM tier's pin refused, or a warm-up out of memory
+// (warm_oom_class) - with the RAM tiers this start set out to pin (all GPUs, GB of 2^30 bytes) and whether their size
+// was not the engine's own choice (ram_tier_sizing: STRATA_GLM_RAM_GB, the API's budget, RAM-resident).  Within one
+// process the tier cannot pin again what it gave back (Windows: ~32 GB unpinned, then not even 256 MB pinned), so
+// serve/server.py starts the engine again with a smaller STRATA_GLM_RAM_GB from it (ram_retry_gb): on manual=0, and
+// on manual=1 when that size was the launcher's own, set by its earlier restart (never when the user set one)
+inline std::string ram_tier_oom_line(int64_t total_bytes, bool manual) {
+    char b[96];
+    std::snprintf(b, sizeof b, "glm fast: RAM-TIER-OOM total_gb=%.2f manual=%d",
+                  (double) std::max<int64_t>(0, total_bytes) / 1073741824.0, manual ? 1 : 0);
+    return b;
+}
+
+// STRATA_GLM_PIN_DIAG's line (glm_fast_path.cu's pin_diag_line): "glm fast: CUDA<dev> pin-diag <when> t=<s after the
+// event> held=<GB the RAM tier's sizing holds pinned now> availphys=<GB of free physical RAM; -1 off Windows>
+// probe256=<1: a 256 MB probe pinned (and was freed again), 0: refused, -: not probed>"
+inline std::string pin_diag_text(int dev, const char* when, double t, int64_t held_b, double avail_gb, int probe) {
+    char b[192], av[32];
+    if (avail_gb >= 0) std::snprintf(av, sizeof av, "%.2f", avail_gb);
+    else std::snprintf(av, sizeof av, "-1");
+    std::snprintf(b, sizeof b, "glm fast: CUDA%d pin-diag %s t=%g held=%.2f availphys=%s probe256=%s", dev, when, t,
+                  (double) std::max<int64_t>(0, held_b) / 1073741824.0, av, probe < 0 ? "-" : probe ? "1" : "0");
+    return b;
+}
+
+// A split start's end when a part failed (glm_model.cu's load_pack_split, the parallel load and the sequential one):
+// the error of the part that failed first, the later failures' after "; then " - the parts the abort stopped are no
+// failures (SplitSync::failures leaves them out) - and, when that first failure was short of pinned memory (tier_oom),
+// the RAM-TIER-OOM line with every given part's tier: total = the sum of max(0, tier_try_b) (-1: the part planned
+// none), manual = any part's.  `failed`: the parts that failed of their own, in order (SplitSync::failures; out of
+// range ignored); empty - the first part not ok stands for it.  No part failed: failed false, no error, no line
+struct SplitPartEnd {
+    bool ok = true;
+    std::string err;
+    int64_t tier_try_b = -1;
+    bool tier_manual = false;
+    bool tier_oom = false;
+};
+struct SplitStartEnd {
+    bool failed = false;
+    std::string err;
+    std::string oom_line;   // (empty: none)
+};
+inline SplitStartEnd split_start_end(std::vector<int> failed, const std::vector<SplitPartEnd>& parts) {
+    SplitStartEnd out;
+    const int n = (int) parts.size();
+    failed.erase(std::remove_if(failed.begin(), failed.end(), [n](int i) { return i < 0 || i >= n; }), failed.end());
+    for (int i = 0; i < n && failed.empty(); ++i)
+        if (!parts[(size_t) i].ok) failed.push_back(i);
+    if (failed.empty()) return out;
+    out.failed = true;
+    out.err = parts[(size_t) failed[0]].err;
+    for (size_t k = 1; k < failed.size(); ++k) out.err += "; then " + parts[(size_t) failed[k]].err;
+    if (parts[(size_t) failed[0]].tier_oom) {
+        int64_t total = 0;
+        bool manual = false;
+        for (const SplitPartEnd& p : parts) {
+            total += std::max<int64_t>(0, p.tier_try_b);
+            manual = manual || p.tier_manual;
+        }
+        out.oom_line = ram_tier_oom_line(total, manual);
+    }
+    return out;
 }
 
 }  // namespace strata::core::glmfast

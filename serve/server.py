@@ -30,6 +30,7 @@ import hmac
 import codecs
 import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -70,7 +71,8 @@ def wait_gpu_release(pid: int, timeout: float = 60.0):
     """An engine that has ended still holds its GPU memory for a few seconds - the driver frees tens of GB of VRAM and
     its pinned RAM tier after the process is gone - and an engine started at once finds the cards full (the split
     search measures them before anything loads: the context reload's new engine got 0.09 GB and failed).  Waits until
-    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD)."""
+    no GPU lists the process any more (NVML), or a few seconds where NVML can't say (AMD).  False: `timeout` passed and
+    the GPUs still list it (the caller goes on anyway, or - a RAM restart - gives up)."""
     try:
         from serve.telemetry import gpu_pids
     except ImportError:
@@ -80,13 +82,14 @@ def wait_gpu_release(pid: int, timeout: float = 60.0):
         pids = gpu_pids() if gpu_pids else None
         if pids is None:
             time.sleep(max(0.0, 5.0 - (time.time() - t0)))
-            return
+            return True
         if pid not in pids:
             if time.time() - t0 > 1:
                 print(f"[maya] the GPUs freed the engine's memory in {time.time() - t0:.0f} s", flush=True)
-            return
+            return True
         time.sleep(0.5)
-    print(f"[maya] the GPUs still list the old engine after {timeout:.0f} s; starting anyway", flush=True)
+    print(f"[maya] the GPUs still list the old engine after {timeout:.0f} s", flush=True)
+    return False
 
 
 CONTEXT_MIN = 4096          # the dashboard's Context size: the smallest it offers ...
@@ -410,6 +413,49 @@ def narrate_start(log_path: str, offset: int, args: list, done: threading.Event,
             print(f"[maya] still starting ({time.time() - t0:.0f} s) - please wait ...", flush=True)
 
 
+# A start that ran out of pinned RAM: the GLM engine's line for it (glm fast: RAM-TIER-OOM total_gb=<the RAM tiers this
+# start tried, all GPUs> manual=<1: the size was set>), and the restarts it gets with a smaller STRATA_GLM_RAM_GB.  The
+# engine cannot shrink its tier itself there: on Windows a process that unpinned ~32 GB could not pin even 256 MB again,
+# while a new process with a smaller size started (two GPUs, 64 GB: 41 GB three times out of three)
+RAM_OOM_RE = re.compile(r"glm fast: RAM-TIER-OOM total_gb=(\d+(?:\.\d+)?) manual=([01])\b")
+RAM_RETRY_MAX = 3          # restarts after the first start
+RAM_RETRY_FLOOR_GB = 1.0   # no restart below this
+RAM_SET_KEY = "STRATA_GLM_RAM_GB"   # the size the engine reads; users set it as MAYA_GLM_RAM_GB (tools/maya_names.py)
+RAM_SET_KEYS = (maya_names.shown(RAM_SET_KEY), RAM_SET_KEY)
+ENGINE_END_WAIT_S = 30.0   # a refused start's process ends within this (its output closed), or it is killed ...
+ENGINE_KILL_WAIT_S = 20.0  # ... and ends within this after the kill
+
+
+def ram_oom_of(text: str | None) -> tuple[float, bool] | None:
+    """The last RAM-TIER-OOM line in `text` (an engine log's tail): (the tiers' total in GB, set by hand), or None."""
+    found = None
+    for m in RAM_OOM_RE.finditer(text or ""):
+        found = (float(m.group(1)), m.group(2) == "1")
+    return found
+
+
+def ram_retry_gb(log_tail: str | None, env: dict, launcher_gb: float | None, restarts: int,
+                 max_restarts: int = RAM_RETRY_MAX) -> float | None:
+    """The STRATA_GLM_RAM_GB to start the engine again with after it ended before READY, or None (no restart: the
+    error stands).  A restart only when the log says the RAM tier ran out of pinned memory, the size was the engine's
+    own choice (manual=0 - or the launcher's last restart set it, `launcher_gb`), the user set no size (MAYA_GLM_RAM_GB /
+    STRATA_GLM_RAM_GB in `env`, the config's and the OS's) and fewer than `max_restarts` ran.  The size: the total
+    tried less max(1 GB, 5%), down to a multiple of 0.5 GB, and below the launcher's last try."""
+    if restarts >= max_restarts or any(env.get(k) for k in RAM_SET_KEYS):
+        return None
+    found = ram_oom_of(log_tail)
+    if found is None:
+        return None
+    total, manual = found
+    if manual and launcher_gb is None:
+        return None
+    if launcher_gb is not None:
+        total = min(total, launcher_gb)
+    step = max(1.0, total * 0.05)
+    nxt = math.floor((total - step) * 2) / 2   # (2-decimal totals, 0.5 GB tries: never a float hair under a step)
+    return nxt if nxt >= RAM_RETRY_FLOOR_GB else None
+
+
 class StrataEngine:
     """The resident engine: `strata --serve` reads `GEN <max_new> <ids>` lines and streams `T <id>` lines, then
     `DONE ...`.  Requests are serialized by the service's FIFO, so one pipe is enough.
@@ -429,6 +475,84 @@ class StrataEngine:
         self.model_path = paths.get("--native") or paths.get("--pack", "pack/full")
         self.log_path = log
         self.log = open(log, "a", encoding="utf-8") if log else subprocess.DEVNULL
+        # a start that runs out of pinned RAM (the engine's RAM-TIER-OOM line) starts again with a smaller tier
+        # (ram_retry_gb); a size that worked is kept for the restarts after a crash (restart()).  The line is read from
+        # the log: without one (log=None) no start is ever restarted - maya.py always gives the engine a log
+        ram_try = getattr(self, "ram_auto_gb", None)
+        restarts = 0
+        while True:
+            log_start = self._start(exe, args, cwd, log, env, ram_try)
+            if self.max_context > 0:
+                break
+            tail = self._log_since(log_start)
+            nxt = ram_retry_gb(tail, env if env is not None else os.environ, ram_try, restarts)
+            # (no restart while the refused engine runs on after its kill, or the GPUs still hold its memory: the
+            # start's own error stands)
+            if nxt is None or not self._end_refused() or not wait_gpu_release(self.proc.pid):
+                self._start_failed(log, tail, ram_try, restarts)
+            restarts += 1
+            print(f"[maya] the engine ran out of pinned RAM at {ram_oom_of(tail)[0]:.2f} GB - restarting with "
+                  f"STRATA_GLM_RAM_GB={nxt:g} ({restarts} of {RAM_RETRY_MAX})", flush=True)
+            ram_try = nxt
+        self.ram_auto_gb = ram_try
+        # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
+        # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
+        if self.info.get("engine"):
+            self.info["version"] = str(self.info["engine"])
+        if log:
+            self._context_cost(log_start)
+        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
+        self.lines: queue.Queue = queue.Queue()
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _start_failed(self, log, tail: str, ram_try: float | None, restarts: int):
+        """Raise the error of a start that ended before READY and gets no restart (the log closed first).  The restarts
+        are named only when this call made some: a remembered size (restart()) that fails for another reason is not
+        one."""
+        why = ""
+        if restarts > 0:
+            found = ram_oom_of(tail)
+            why = (f" - {restarts} restart(s) with a smaller RAM tier, the last at STRATA_GLM_RAM_GB={ram_try:g}" +
+                   (f" ran out of pinned RAM at {found[0]:.2f} GB" if found else ""))
+        if log:
+            self.log.close()   # (no engine writes to it any more)
+        raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") + why)
+
+    def _end_refused(self):
+        """A start refused for want of pinned RAM: its process is ending (its output closed) - wait for it, or end it,
+        so no engine is left behind the restart.  False: it still runs after the kill (no restart then)."""
+        gone = True
+        try:
+            self.proc.wait(timeout=ENGINE_END_WAIT_S)
+        except subprocess.TimeoutExpired:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=ENGINE_KILL_WAIT_S)
+            except (OSError, subprocess.TimeoutExpired):
+                gone = False
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            with contextlib.suppress(OSError):
+                pipe.close()
+        return gone
+
+    def _log_since(self, offset: int, most: int = 256 << 10) -> str:
+        """The engine log from `offset` (this start's), its last `most` bytes at most; empty without a log (log=None:
+        then no RAM-TIER-OOM line is ever found, and a start short of pinned RAM is not restarted)."""
+        if not self.log_path:
+            return ""
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(0, 2)
+                f.seek(max(offset, f.tell() - most))
+                return f.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def _start(self, exe: str, args: list[str], cwd, log, env, ram_gb: float | None) -> int:
+        """One start of the engine, until READY or its output closes (max_context stays 0); the log's offset before it.
+        `ram_gb`: STRATA_GLM_RAM_GB for this start (a restart after the RAM tier ran out of pinned memory)."""
+        if ram_gb is not None:
+            env = {**(env if env is not None else os.environ), RAM_SET_KEY: f"{ram_gb:g}"}
         loading = threading.Event()                     # set once READY: the narrator below stops
         log_start = os.path.getsize(log) if log else 0
         if log:
@@ -472,17 +596,7 @@ class StrataEngine:
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
-        if self.max_context <= 0:
-            raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else ""))
-        # (from PR #41, midhatn) a locally built engine can sit next to another release's BUILD.json: engines that
-        # report their own version (INFO engine=, 0.1.8+) win, the manifest stays the fallback for older ones
-        if self.info.get("engine"):
-            self.info["version"] = str(self.info["engine"])
-        if log:
-            self._context_cost(log_start)
-        # the engine's stdout on a thread, so a request can wait with a timeout (heartbeats, cancel checks)
-        self.lines: queue.Queue = queue.Queue()
-        threading.Thread(target=self._pump, daemon=True).start()
+        return log_start
 
     def _context_cost(self, offset: int):
         """What this start's context costs in VRAM, from the GLM engine's own start lines ("CUDA0 VRAM before the

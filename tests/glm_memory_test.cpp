@@ -2,8 +2,199 @@
 #include "../src/core/glm_memory.hpp"
 
 #undef NDEBUG   // the checks are asserts: keep them in Release builds
+#include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <chrono>
+#include <climits>
+#include <cmath>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <set>
+#include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+namespace {
+using strata::core::glmfast::TierPin;
+constexpr int64_t kGi = int64_t{1} << 30, kMi = int64_t{1} << 20, kRoom = 512 * kMi;   // kRoom: kPinRoom
+
+// A driver with a pinning cap (STRATA_GLM_PIN_CAP_MB's model of Windows): it refuses what takes the bytes held past cap
+struct PinSim {
+    int64_t cap = 0, held = 0;
+    // pin_room: probes of 1 GiB, then of 256 MiB, up to limit - freed again
+    int64_t room(int64_t limit) const {
+        int64_t got = 0;
+        for (const int64_t probe : {kGi, 256 * kMi})
+            while (got + probe <= limit && held + got + probe <= cap) got += probe;
+        return got;
+    }
+};
+// One part's RAM tier: its classes' planned slots, slot bytes and floors (16), and its small pinned buffers
+struct Part {
+    std::vector<int64_t> plan, stride, least;
+    int64_t small = 64 * kMi;
+    TierPin tp;
+    Part(std::vector<int64_t> gib, std::vector<int64_t> st) : stride(st) {
+        for (size_t c = 0; c < gib.size(); ++c) plan.push_back(gib[c] / st[c]);
+        least.assign(plan.size(), 16);
+    }
+    int64_t planned() const {
+        int64_t b = 0;
+        for (size_t c = 0; c < plan.size(); ++c) b += plan[c] * stride[c];
+        return b;
+    }
+    int64_t pinned() const {
+        int64_t b = 0;
+        for (size_t c = 0; c < tp.n.size(); ++c) b += tp.n[c] * stride[c];
+        return b;
+    }
+};
+// fast_setup's calls: a class pins, then the room kept above the tier must pin too (freed again), or the class goes
+bool pin_part(PinSim& s, Part& p, const std::vector<int64_t>& n, int64_t keep, int64_t later, int64_t reserve,
+              bool measure_later) {
+    return strata::core::glmfast::pin_tier_classes(
+        p.tp, n, p.stride, p.least, later, reserve, measure_later,
+        [&](size_t c, int64_t k) {
+            const int64_t b = k * p.stride[c];
+            if (s.held + b > s.cap || s.held + b + keep > s.cap) return false;
+            s.held += b;
+            return true;
+        },
+        [&](size_t c, int64_t k) { s.held -= k * p.stride[c]; }, [&](int64_t limit, bool) { return s.room(limit); });
+}
+// A parallel split under a cap as fast_setup runs it: every part plans, then each in turn pins its small buffers and
+// its tier at the split's scale - the first one measuring the room for the later ones.  capped false: v1.1.20's split
+// (no later parts, one GPU's room), the reference
+// ok: false at the first part whose start fails (the later ones are not tried)
+bool run_split(PinSim& s, std::vector<Part>& parts, bool capped) {
+    using namespace strata::core::glmfast;
+    const int np = (int) parts.size();
+    const int64_t keep = pin_room_kept(kRoom, np, capped);
+    std::vector<int64_t> plan, small;
+    for (const Part& p : parts) {
+        plan.push_back(p.planned());
+        small.push_back(p.small);
+    }
+    double scale = 1.0;
+    bool measured = false;
+    for (int i = 0; i < np; ++i) {
+        Part& p = parts[(size_t) i];
+        s.held += p.small;
+        const auto lr = capped ? split_later(plan, small, i, scale, keep) : std::make_pair(int64_t{0}, keep);
+        std::vector<int64_t> n(p.plan.size());
+        for (size_t c = 0; c < n.size(); ++c) n[c] = scaled_slots(p.plan[c], p.least[c], scale);
+        if (!pin_part(s, p, n, keep, lr.first, lr.second, capped && !measured && i + 1 < np)) return false;
+        if (lr.first > 0 && p.tp.later_measured) {
+            scale *= p.tp.later_scale;
+            measured = true;
+        }
+    }
+    return true;
+}
+void pin_split(PinSim& s, std::vector<Part>& parts, bool capped) {
+    const bool ok = run_split(s, parts, capped);
+    assert(ok);
+}
+// v1.1.20's class loop, step for step: what one GPU's tier must still come out as
+bool old_tier(PinSim& s, const std::vector<int64_t>& cls_n, const std::vector<int64_t>& stride, std::vector<int64_t>& out) {
+    int64_t pin_left = -1;
+    out.assign(cls_n.size(), 0);
+    const auto share = [&](size_t c) {
+        int64_t planned = 0;
+        for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * stride[k];
+        const double f = (double) std::max<int64_t>(0, pin_left - kRoom) / (double) std::max<int64_t>(1, planned);
+        return (int64_t) (f * (double) cls_n[c]);
+    };
+    for (size_t c = 0; c < cls_n.size(); ++c) {
+        int64_t n = cls_n[c];
+        const int64_t least = 16;
+        if (pin_left >= 0) n = std::max(least, std::min(n, share(c)));
+        bool p = false;
+        for (int tries = 0; n >= least; ++tries) {
+            if (s.held + n * stride[c] <= s.cap && s.held + n * stride[c] + kRoom <= s.cap) {
+                s.held += n * stride[c];
+                p = true;
+                break;
+            }
+            if (pin_left < 0) {
+                int64_t planned = 0;
+                for (size_t k = c; k < cls_n.size(); ++k) planned += cls_n[k] * stride[k];
+                pin_left = s.room(planned + kRoom);
+                const int64_t fit = share(c);
+                if (fit < n) {
+                    n = std::max(least, fit);
+                    continue;
+                }
+            }
+            const int64_t less = tries < 4 ? n * 31 / 32 : n * 7 / 8;
+            n = (n > least && less < least) ? least : less;
+        }
+        if (p && pin_left >= 0) pin_left = std::max<int64_t>(0, pin_left - n * stride[c]);
+        if (!p) return false;
+        out[c] = n;
+    }
+    return true;
+}
+// Checks added for the dual-GPU pin tier.  A check named in kKnownFail is a finding the current code does not meet
+// and this round does not fix: it must still be red (an expected failure), and the run fails if it turns green.
+// STRATA_TEST_NO_XFAIL=1 reports those as plain failures.
+const std::set<std::string> kKnownFail = {};
+int g_checks = 0, g_xfail = 0, g_bad = 0;
+void check(const char* id, bool ok, const std::string& detail = "") {
+    ++g_checks;
+    const bool no_xfail = std::getenv("STRATA_TEST_NO_XFAIL") != nullptr;
+    const bool known = !no_xfail && kKnownFail.count(id) != 0;
+    if (known) {
+        if (ok) {
+            ++g_bad;
+            std::printf("UNEXPECTED PASS (strict xfail): %s\n", id);
+        } else {
+            ++g_xfail;
+            std::printf("xfail: %s  %s\n", id, detail.c_str());
+        }
+    } else if (!ok) {
+        ++g_bad;
+        std::printf("FAIL: %s  %s\n", id, detail.c_str());
+    }
+}
+// a sweep keeps its first failing input
+struct Sweep {
+    bool ok = true;
+    int fails = 0;
+    std::string first, last;
+    void expect(bool c, const std::string& what) {
+        if (c) return;
+        if (ok) first = what;
+        ok = false;
+        ++fails;
+        last = what;
+    }
+    std::string why() const { return first + (fails > 1 ? "  [" + std::to_string(fails) + " failing inputs, last: " + last + "]" : ""); }
+};
+std::string gib(int64_t b) { return std::to_string((double) b / (double) kGi) + "GiB"; }
+// the 64 GiB PC's two-card split: a 30.8 GiB plan and a 13.5 GiB one, in two size classes each
+std::vector<Part> two_parts() {
+    const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+    return {Part({9 * kGi, (int64_t) (21.8 * (double) kGi)}, st), Part({4 * kGi, (int64_t) (9.5 * (double) kGi)}, st)};
+}
+std::vector<Part> three_parts() {
+    const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+    return {Part({8 * kGi, 12 * kGi}, st), Part({5 * kGi, 10 * kGi}, st), Part({4 * kGi, 6 * kGi}, st)};
+}
+// the smallest cap that can hold every floor (16 slots a class), the small buffers and the room kept above them
+int64_t floors_cap(const std::vector<Part>& ps, int64_t keep) {
+    int64_t b = keep;
+    for (const Part& p : ps) {
+        b += p.small;
+        for (size_t c = 0; c < p.plan.size(); ++c) b += p.least[c] * p.stride[c];
+    }
+    return b;
+}
+}  // namespace
 
 int main() {
     using strata::core::glmfast::expert_pool_budget;
@@ -100,5 +291,1394 @@ int main() {
     // the page file that keeps 33 GiB more on the GPU, with 128 GiB of RAM and a 32 GiB page file now: 65 GiB
     assert(pagefile_hint_gib(160 * G, 128 * G, 33 * G) == 65);
     assert(pagefile_hint_gib(160 * G, 128 * G, 33 * G - 1) == 65 && pagefile_hint_gib(128 * G, 128 * G, 1) == 1);
+
+    // The RAM tier under a pinning cap (pin_tier_classes).  The room kept above the tiers: one GPU's 512 MiB, or under
+    // a cap one for each GPU of a split and one for their warm-ups; what a split's part pins beside; the scaled slots
+    using strata::core::glmfast::pin_room_kept;
+    using strata::core::glmfast::split_later;
+    using strata::core::glmfast::scaled_slots;
+    assert(pin_room_kept(kRoom, 1, true) == kRoom && pin_room_kept(kRoom, 2, false) == kRoom);
+    assert(pin_room_kept(kRoom, 2, true) == 3 * kRoom && pin_room_kept(kRoom, 3, true) == 4 * kRoom);
+    assert(split_later({30 * kGi, 13 * kGi}, {64 * kMi, 64 * kMi}, 0, 1.0, 3 * kRoom) ==
+           std::make_pair(13 * kGi, 3 * kRoom + 64 * kMi));
+    assert(split_later({30 * kGi, 13 * kGi}, {64 * kMi, 64 * kMi}, 1, 1.0, 3 * kRoom) ==
+           std::make_pair(int64_t{0}, 3 * kRoom));
+    assert(split_later({30 * kGi, 13 * kGi, 8 * kGi}, {kMi, kMi, kMi}, 0, 0.5, kRoom) ==
+           std::make_pair(21 * kGi / 2, kRoom + 2 * kMi));
+    assert(scaled_slots(100, 16, 1.0) == 100 && scaled_slots(100, 16, 0.5) == 50 && scaled_slots(20, 16, 0.5) == 16);
+    // One GPU (no later parts, 512 MiB kept): the tier comes out as v1.1.20's loop made it, step for step - caps that
+    // hold it all, cut it at the first class or a later one, and leave a class only its floor or not even that
+    {
+        const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024, 4096 * 1024};
+        for (int64_t cap = 0; cap <= 64 * kGi; cap += 97 * kMi + 12345) {
+            for (const auto& gib : {std::vector<int64_t>{9 * kGi, 41 * kGi, kGi}, std::vector<int64_t>{30 * kGi},
+                                    std::vector<int64_t>{2 * kGi, 200 * kMi, 20 * kGi}}) {
+                const std::vector<int64_t> s3(st.begin(), st.begin() + (std::ptrdiff_t) gib.size());
+                Part p(gib, s3);
+                PinSim a{cap, 0}, b{cap, 0};
+                std::vector<int64_t> ref;
+                const bool ok_ref = old_tier(a, p.plan, p.stride, ref);
+                const bool ok = pin_part(b, p, p.plan, kRoom, 0, kRoom, false);
+                assert(ok == ok_ref && b.held == a.held && !p.tp.later_measured && !p.tp.repinned);
+                if (ok) assert(p.tp.n == ref);
+            }
+        }
+        // this PC's one-GPU start: a 9 GiB class pins, the 41 GiB one meets the cap, 35.5 GiB more pin - the tier
+        // ~44 GiB, 512 MiB+ still free above it
+        Part p({9 * kGi, 41 * kGi}, {6656 * 1024, 7168 * 1024});
+        PinSim s{(int64_t) (44.6 * (double) kGi), 0};
+        assert(pin_part(s, p, p.plan, kRoom, 0, kRoom, false));
+        assert(p.tp.n[0] == p.plan[0] && p.pinned() > 43 * kGi + 768 * kMi && s.cap - s.held >= kRoom);
+    }
+    // Two GPUs under the cap of this PC's 64 GiB (~44.6 GiB of tier pinned once nothing else was): the first part
+    // plans 30.8 GiB, the second 13.5.  v1.1.20 pinned the first one whole and left the second what was left - here
+    // 44.0 GiB in all and 0.6 free, as STRATA_GLM_RAM_GB=44's start whose warmed tables did not upload; now the first
+    // one measures the room for the second after its tier, finds it short, and both pin ~97% of their plans (43.0 GiB,
+    // as =43's start), 1.5 GiB+ (a GPU's room each and one for the warm-ups) still free
+    {
+        const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+        std::vector<Part> was = {Part({9 * kGi, (int64_t) (21.8 * (double) kGi)}, st),
+                                 Part({4 * kGi, (int64_t) (9.5 * (double) kGi)}, st)};
+        PinSim w{(int64_t) (44.75 * (double) kGi), 0};
+        pin_split(w, was, false);
+        assert(was[0].pinned() == was[0].planned() && w.cap - w.held < 2 * kRoom);
+        std::vector<Part> parts = {Part({9 * kGi, (int64_t) (21.8 * (double) kGi)}, st),
+                                   Part({4 * kGi, (int64_t) (9.5 * (double) kGi)}, st)};
+        PinSim s{(int64_t) (44.75 * (double) kGi), 0};
+        pin_split(s, parts, true);
+        const double f0 = (double) parts[0].pinned() / (double) parts[0].planned();
+        const double f1 = (double) parts[1].pinned() / (double) parts[1].planned();
+        assert(parts[0].tp.repinned && parts[0].tp.later_room >= 0 && !parts[1].tp.later_measured);
+        assert(f0 > 0.95 && f0 < 1.0 && std::fabs(f0 - f1) < 0.01);
+        assert(parts[1].pinned() > 12 * kGi + 768 * kMi);
+        assert(s.cap - s.held >= 3 * kRoom);
+        // ... with room for both: the first part's probe finds it, nothing pins again, both pin all of their plans
+        std::vector<Part> big = {Part({9 * kGi, (int64_t) (21.8 * (double) kGi)}, st),
+                                 Part({4 * kGi, (int64_t) (9.5 * (double) kGi)}, st)};
+        PinSim r{100 * kGi, 0};
+        pin_split(r, big, true);
+        assert(big[0].tp.later_measured && big[0].tp.later_scale == 1.0 && !big[0].tp.repinned);
+        assert(big[0].pinned() == big[0].planned() && big[1].pinned() == big[1].planned());
+        assert(r.held == big[0].planned() + big[1].planned() + 2 * 64 * kMi);
+        // ... a cap the first part's own plan meets (32 GiB): v1.1.20 kept the first part whole and gave the second
+        // under a tenth of its plan; now the first part's refusal measures the room for both - its classes from the
+        // refused one on and the second part each pin ~60% of their plans (its first class pinned whole before)
+        std::vector<Part> old = {Part({9 * kGi, (int64_t) (21.8 * (double) kGi)}, st),
+                                 Part({4 * kGi, (int64_t) (9.5 * (double) kGi)}, st)};
+        PinSim o{32 * kGi, 0};
+        pin_split(o, old, false);
+        assert(old[0].pinned() == old[0].planned() && old[1].pinned() < old[1].planned() / 10);
+        std::vector<Part> tight = {Part({9 * kGi, (int64_t) (21.8 * (double) kGi)}, st),
+                                   Part({4 * kGi, (int64_t) (9.5 * (double) kGi)}, st)};
+        PinSim t{32 * kGi, 0};
+        pin_split(t, tight, true);
+        const double g0 = (double) tight[0].pinned() / (double) tight[0].planned();
+        const double g1 = (double) tight[1].pinned() / (double) tight[1].planned();
+        const double c1 = (double) tight[0].tp.n[1] / (double) tight[0].plan[1];
+        assert(!tight[0].tp.repinned && tight[0].tp.later_room < 0 && tight[0].tp.later_measured);
+        assert(tight[0].tp.n[0] == tight[0].plan[0] && g0 > g1 && g1 > 0.55 && std::fabs(c1 - g1) < 0.01);
+        assert(t.cap - t.held >= 3 * kRoom);
+    }
+    // Three GPUs, 40 GiB under the cap, plans of 20, 15 and 10 GiB: each ~84%, 2 GiB still free; the later two pin
+    // at the first one's measurement without probing again
+    {
+        const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+        std::vector<Part> parts = {Part({8 * kGi, 12 * kGi}, st), Part({5 * kGi, 10 * kGi}, st),
+                                   Part({4 * kGi, 6 * kGi}, st)};
+        PinSim s{40 * kGi, 0};
+        pin_split(s, parts, true);
+        double lo = 1.0, hi = 0.0;
+        for (const Part& p : parts) {
+            const double f = (double) p.pinned() / (double) p.planned();
+            lo = std::min(lo, f);
+            hi = std::max(hi, f);
+        }
+        assert(lo > 0.8 && hi < 0.87 && hi - lo < 0.01);
+        assert(parts[0].tp.later_measured && !parts[1].tp.later_measured && !parts[2].tp.later_measured);
+        assert(s.cap - s.held >= 4 * kRoom);
+    }
+    // ---- Dual-GPU pin tier: boundaries, error paths and silent wrong values (check/xfail harness above) ----
+    using strata::core::glmfast::pin_tier_classes;
+    {   // pin_room_kept (spec: a capped split keeps one room per GPU plus the warm-ups'; one GPU or uncapped keeps one)
+        check("room_kept.zero_room", pin_room_kept(0, 1, true) == 0 && pin_room_kept(0, 2, true) == 0 &&
+                                         pin_room_kept(0, 3, false) == 0);
+        check("room_kept.n_parts_edges", pin_room_kept(kRoom, 0, true) == kRoom && pin_room_kept(kRoom, 1, false) == kRoom &&
+                                             pin_room_kept(kRoom, 3, false) == kRoom && pin_room_kept(kRoom, 8, true) == 9 * kRoom);
+    }
+    {   // split_later (spec: a part's later tiers at the split's scale, reserve = keep + the later parts' small buffers)
+        const std::vector<int64_t> plan = {30 * kGi, 13 * kGi}, small = {64 * kMi, 32 * kMi};
+        check("split_later.past_the_end", split_later(plan, small, 2, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom) &&
+                                              split_later(plan, small, 99, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom));
+        check("split_later.negative_part_counts_all",
+              split_later(plan, small, -1, 1.0, kRoom) == std::make_pair(43 * kGi, kRoom + 96 * kMi));
+        check("split_later.scale_zero_keeps_reserve",
+              split_later(plan, small, 0, 0.0, kRoom) == std::make_pair(int64_t{0}, kRoom + 32 * kMi));
+        check("split_later.empty_and_single", split_later({}, {}, 0, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom) &&
+                                                  split_later({7 * kGi}, {kMi}, 0, 1.0, kRoom) == std::make_pair(int64_t{0}, kRoom));
+        check("split_later.length_mismatch_ignores_unmatched",
+              split_later({30 * kGi, 13 * kGi, 8 * kGi}, {kMi, kMi}, 0, 1.0, kRoom) == std::make_pair(13 * kGi, kRoom + kMi) &&
+                  split_later({30 * kGi, 13 * kGi}, {kMi, kMi, kMi}, 0, 1.0, kRoom) == std::make_pair(13 * kGi, kRoom + kMi));
+    }
+    {   // scaled_slots (spec: never negative, never under the floor, never over the plan, scale 1.0 changes nothing)
+        check("scaled.scale_one_is_plan", scaled_slots(100, 16, 1.0) == 100 && scaled_slots(0, 16, 1.0) == 0 &&
+                                              scaled_slots(100, 16, 7.0) == 100);
+        check("scaled.floor_cases", scaled_slots(100, 16, 0.0) == 16 && scaled_slots(100, 16, -1.0) == 16 &&
+                                        scaled_slots(0, 16, 0.5) == 16 && scaled_slots(32, 16, 0.5) == 16 &&
+                                        scaled_slots(33, 16, 0.5) == 16 && scaled_slots(34, 16, 0.5) == 17);
+        Sweep sw;
+        for (int64_t n = 16; n <= 400; n += 7)
+            for (double sc = 0.0; sc < 1.0; sc += 0.0625) {
+                const int64_t v = scaled_slots(n, 16, sc);
+                sw.expect(v >= 16 && v <= n, "n=" + std::to_string(n) + " scale=" + std::to_string(sc) + " -> " + std::to_string(v));
+                sw.expect(scaled_slots(n, 16, sc + 0.0625) >= v || sc + 0.0625 >= 1.0, "monotone n=" + std::to_string(n));
+            }
+        check("scaled.in_floor_and_plan_range", sw.ok, sw.why());
+        // a plan already under the floor: the floor wins over the plan (16, not 10; scaled.floor_cases pins the plan 0
+        // case; fast_setup never plans under the floor)
+        check("scaled.floor_wins_over_plan_under_floor",
+              scaled_slots(10, 16, 0.5) == 16 && scaled_slots(10, 16, 0.0) == 16 && scaled_slots(10, 16, 1.0) == 10,
+              "scaled_slots(10, 16, 0.5) = " + std::to_string(scaled_slots(10, 16, 0.5)));
+    }
+    {   // pin_tier_classes, one part: boundaries and error paths
+        const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+        {   // no classes at all
+            TierPin tp;
+            const bool ok = pin_tier_classes(tp, {}, {}, {}, 0, kRoom, false, [](size_t, int64_t) { return false; },
+                                             [](size_t, int64_t) {}, [](int64_t, bool) { return int64_t{0}; });
+            check("tier.no_classes", ok && tp.n.empty() && tp.pin_left == -1);
+        }
+        {   // a cap exactly the plan plus the room kept: all of it, no refusal; one byte less: not all, never over the cap
+            Part p({30 * kGi}, {st[0]});
+            PinSim s{p.planned() + kRoom, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 0, kRoom, false);
+            check("tier.cap_equals_plan_plus_keep", ok && p.tp.n[0] == p.plan[0] && p.tp.pin_left == -1 && s.held + kRoom <= s.cap);
+            Part q({30 * kGi}, {st[0]});
+            PinSim t{q.planned() + kRoom - 1, 0};
+            const bool ok2 = pin_part(t, q, q.plan, kRoom, 0, kRoom, false);
+            check("tier.cap_one_byte_short", ok2 && q.tp.n[0] < q.plan[0] && q.tp.n[0] >= 16 && t.held + kRoom <= t.cap,
+                  "ok=" + std::to_string(ok2) + " n=" + std::to_string(q.tp.n[0]) + " plan=" + std::to_string(q.plan[0]));
+        }
+        {   // a class planned at 0 slots: the start fails exactly as v1.1.20's loop did (n 0 is under the floor)
+            Part p({0, 5 * kGi}, st);
+            PinSim a{64 * kGi, 0}, b{64 * kGi, 0};
+            std::vector<int64_t> ref;
+            const bool r = old_tier(a, p.plan, p.stride, ref);
+            const bool ok = pin_part(b, p, p.plan, kRoom, 0, kRoom, false);
+            check("tier.class_planned_zero_as_v1120", ok == r && b.held == a.held, "new=" + std::to_string(ok) + " old=" + std::to_string(r));
+        }
+        {   // every pin refused and no room: the start fails, terminates, holds nothing
+            Part p({9 * kGi, 5 * kGi}, st);
+            int calls = 0, unpins = 0;
+            const bool ok = pin_tier_classes(p.tp, p.plan, p.stride, p.least, 0, kRoom, false,
+                                             [&](size_t, int64_t) { ++calls; return false; },
+                                             [&](size_t, int64_t) { ++unpins; }, [](int64_t, bool) { return int64_t{0}; });
+            check("tier.pin_always_refused", !ok && calls > 0 && calls < 200 && unpins == 0 && p.tp.pin_left == 0);
+            Part q({9 * kGi, 5 * kGi}, st);
+            int qc = 0;
+            const bool ok2 = pin_tier_classes(q.tp, q.plan, q.stride, q.least, 4 * kGi, kRoom, true,
+                                              [&](size_t, int64_t) { ++qc; return false; }, [](size_t, int64_t) {},
+                                              [](int64_t, bool) { return int64_t{0}; });
+            check("tier.pin_always_refused_with_later", !ok2 && qc < 200);
+        }
+        {   // room measured 0 but the floor pins: every class gets its floor, not 0 or a negative count
+            Part p({9 * kGi, 5 * kGi}, st);
+            const bool ok = pin_tier_classes(p.tp, p.plan, p.stride, p.least, 0, kRoom, false,
+                                             [&](size_t c, int64_t k) { return k <= p.least[c]; }, [](size_t, int64_t) {},
+                                             [](int64_t, bool) { return int64_t{0}; });
+            check("tier.room_zero_gives_floor", ok && p.tp.n[0] == 16 && p.tp.n[1] == 16 && p.tp.pin_left == 0);
+        }
+        {   // a cap under the room kept: nothing pins, no count under 0, nothing left held
+            Part p({9 * kGi, 5 * kGi}, st);
+            PinSim s{kRoom / 2, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 0, kRoom, false);
+            bool neg = false;
+            for (const int64_t v : p.tp.n) neg = neg || v < 0;
+            check("tier.cap_below_keep", !ok && !neg && s.held == 0);
+        }
+        {   // a negative `later` is none (clamped): same tier and same cap use as later 0
+            Part p({9 * kGi, 41 * kGi}, st), q({9 * kGi, 41 * kGi}, st);
+            PinSim a{44 * kGi, 0}, b{44 * kGi, 0};
+            const bool oa = pin_part(a, p, p.plan, kRoom, 0, kRoom, true);
+            const bool ob = pin_part(b, q, q.plan, kRoom, -5 * kGi, kRoom, true);
+            check("tier.negative_later_is_zero", oa == ob && p.tp.n == q.tp.n && a.held == b.held && !q.tp.later_measured);
+        }
+        {   // the later parts' probe finds too little (the tier took the room): the tier pins again at its share, no leak
+            Part p({10 * kGi}, {st[0]});
+            PinSim s{p.planned() + kRoom, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 5 * kGi, kRoom, true);
+            Sweep sw;
+            sw.expect(ok, "start failed");
+            sw.expect(p.tp.repinned && p.tp.later_measured && p.tp.later_room >= 0, "not repinned/measured");
+            sw.expect(p.tp.n.size() == 1 && p.tp.n[0] >= 16 && p.tp.n[0] < p.plan[0], "n=" + std::to_string(p.tp.n[0]));
+            sw.expect(s.held == p.pinned(), "held " + gib(s.held) + " != pinned " + gib(p.pinned()) + " (unpin leak)");
+            sw.expect(s.held + kRoom <= s.cap, "over cap");
+            sw.expect(p.tp.later_scale >= 0.0 && p.tp.later_scale <= 1.0, "later_scale " + std::to_string(p.tp.later_scale));
+            check("tier.later_probe_short_repins", sw.ok, sw.why());
+        }
+        {   // the later parts' probe finds all they need (rounded to the probe step): no repin
+            Part p({10 * kGi}, {st[0]});
+            PinSim s{p.planned() + kRoom + 5 * kGi, 0};
+            const bool ok = pin_part(s, p, p.plan, kRoom, 5 * kGi, kRoom, true);
+            check("tier.later_probe_exact_no_repin", ok && !p.tp.repinned && p.tp.later_measured && p.tp.later_scale == 1.0 &&
+                                                         p.tp.n[0] == p.plan[0]);
+        }
+    }
+    {   // A split's part keeps the floors (guarded: later parts, or a reserve over one GPU's room); one GPU does not
+        const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024};
+        const int64_t keep3 = 3 * kRoom;
+        {   // the last part: its first class would pin whole and leave the next one less than its floor
+            Part p({9 * kGi, 21 * kGi}, st);
+            PinSim s{p.plan[0] * p.stride[0] + keep3 + 64 * kMi, 0};
+            const bool ok = pin_part(s, p, p.plan, keep3, 0, keep3, false);
+            check("guard.last_part_leaves_next_class_floor",
+                  ok && p.tp.n[0] >= 16 && p.tp.n[0] < p.plan[0] && p.tp.n[1] >= 16 && s.held + keep3 <= s.cap,
+                  "ok=" + std::to_string(ok) + " n0=" + std::to_string(p.tp.n.empty() ? -1 : p.tp.n[0]) + " n1=" +
+                      std::to_string(p.tp.n.size() < 2 ? -1 : p.tp.n[1]));
+            // ... the same cap on one GPU (the room kept 512 MiB, no later parts) is v1.1.20's: the first class pins whole
+            Part q({9 * kGi, 21 * kGi}, st);
+            PinSim a{s.cap, 0}, b{s.cap, 0};
+            std::vector<int64_t> ref;
+            const bool ok_ref = old_tier(a, q.plan, q.stride, ref);
+            const bool ok_new = pin_part(b, q, q.plan, kRoom, 0, kRoom, false);
+            check("guard.one_gpu_same_cap_as_v1120", ok_new == ok_ref && a.held == b.held && (!ok_new || q.tp.n == ref),
+                  "new=" + std::to_string(ok_new) + " old=" + std::to_string(ok_ref));
+        }
+        {   // a part with a later part: its first class would pin whole and leave the later part under its floors
+            Part p({9 * kGi, 21 * kGi}, st);
+            const int64_t later = 13 * kGi, later_floors = 16 * (st[0] + st[1]), reserve = keep3 + 64 * kMi;
+            PinSim s{p.plan[0] * p.stride[0] + reserve + later_floors / 2, 0};
+            const bool ok = pin_part(s, p, p.plan, keep3, later, reserve, false);
+            check("guard.part_leaves_later_floors",
+                  ok && p.tp.n[0] >= 16 && p.tp.n[1] >= 16 && s.held + reserve + later_floors <= s.cap,
+                  "ok=" + std::to_string(ok) + " held=" + gib(s.held) + " cap=" + gib(s.cap));
+        }
+        {   // a warm-up retry's re-pin on one GPU asks for the guard (guard true): the first class would pin whole and
+            // leave the next one under its floor - guarded, both keep their floors; unguarded (v1.1.20) the start fails
+            const auto run = [&](bool guard, Part& p, PinSim& s) {
+                return strata::core::glmfast::pin_tier_classes(
+                    p.tp, p.plan, p.stride, p.least, 0, kRoom, false,
+                    [&](size_t c, int64_t k) {
+                        const int64_t b = k * p.stride[c];
+                        if (s.held + b + kRoom > s.cap) return false;
+                        s.held += b;
+                        return true;
+                    },
+                    [&](size_t c, int64_t k) { s.held -= k * p.stride[c]; }, [&](int64_t limit, bool) { return s.room(limit); },
+                    guard);
+            };
+            Part p({9 * kGi, 21 * kGi}, st), q({9 * kGi, 21 * kGi}, st);
+            const int64_t cap = p.plan[0] * p.stride[0] + kRoom + 32 * kMi;
+            PinSim s{cap, 0}, t{cap, 0};
+            const bool ok = run(true, p, s), ok_old = run(false, q, t);
+            check("guard.forced_one_gpu_keeps_next_class_floor",
+                  ok && p.tp.n[0] >= 16 && p.tp.n[0] < p.plan[0] && p.tp.n[1] >= 16 && s.held + kRoom <= s.cap && !ok_old,
+                  "ok=" + std::to_string(ok) + " n0=" + std::to_string(p.tp.n.empty() ? -1 : p.tp.n[0]) + " n1=" +
+                      std::to_string(p.tp.n.size() < 2 ? -1 : p.tp.n[1]) + " unguarded ok=" + std::to_string(ok_old));
+        }
+        {   // a cap that cannot hold even the floors still fails the start, and holds nothing it could not keep
+            Part p({9 * kGi, 21 * kGi}, st);
+            PinSim s{keep3 + 16 * st[0], 0};
+            const bool ok = pin_part(s, p, p.plan, keep3, 0, keep3, false);
+            check("guard.cap_under_floors_fails", !ok && s.held + keep3 <= s.cap && s.held == p.pinned(),
+                  "ok=" + std::to_string(ok) + " held=" + gib(s.held) + " pinned=" + gib(p.pinned()));
+        }
+    }
+    {   // One, two and three GPUs under a pinning cap.  Spec: every part gets > 0 of every class, the total plus the room
+        // kept stays under the cap, a roomy cap gives each part its whole plan, a count is never negative or over its plan
+        for (int np = 1; np <= 3; ++np) {
+            const std::string tag = "dual" + std::to_string(np);
+            const auto make = [&]() { return np == 1 ? std::vector<Part>{two_parts()[0]} : (np == 2 ? two_parts() : three_parts()); };
+            int64_t total_plan = 0, smalls = 0;
+            for (const Part& p : make()) {
+                total_plan += p.planned();
+                smalls += p.small;
+            }
+            const int64_t keep = pin_room_kept(kRoom, np, true);
+            Sweep inv, floors, full, tier0;
+            for (int64_t cap = 0; cap <= total_plan + smalls + keep + 3 * kGi; cap += 173 * kMi + 12345) {
+                std::vector<Part> parts = make();
+                PinSim s{cap, 0};
+                const bool ok = run_split(s, parts, true);
+                const std::string at = "cap=" + gib(cap) + " ";
+                if (ok) {
+                    int64_t sum = 0;
+                    for (size_t i = 0; i < parts.size(); ++i) {
+                        const Part& p = parts[i];
+                        sum += p.small + p.pinned();
+                        for (size_t c = 0; c < p.tp.n.size(); ++c) {
+                            const std::string pc = "part " + std::to_string(i) + " class " + std::to_string(c);
+                            inv.expect(p.tp.n[c] > 0, at + pc + " got 0");
+                            inv.expect(p.tp.n[c] >= 16, at + pc + " under its floor");
+                            inv.expect(p.tp.n[c] <= p.plan[c], at + pc + " over its plan: " + std::to_string(p.tp.n[c]) + ">" + std::to_string(p.plan[c]));
+                        }
+                        tier0.expect(p.pinned() > 0, at + "part " + std::to_string(i) + " tier 0");
+                    }
+                    inv.expect(s.held == sum, at + "held " + gib(s.held) + " != parts' sum " + gib(sum));
+                    inv.expect(s.held + keep <= cap, at + "total " + gib(s.held) + " + kept " + gib(keep) + " over the cap");
+                }
+                // one GPU keeps v1.1.20 (a class that pins whole before the first refusal may leave the next one nothing): not a dual spec
+                if (np > 1 && cap >= floors_cap(parts, keep) + kGi) floors.expect(ok, at + "a part's start failed though all floors fit");
+                if (cap >= total_plan + smalls + keep + kGi) {
+                    bool whole = ok;
+                    for (const Part& p : parts) whole = whole && p.pinned() == p.planned();
+                    full.expect(whole, at + "roomy cap but a part is under its plan");
+                }
+            }
+            check((tag + ".total_plus_keep_within_cap_and_counts_in_range").c_str(), inv.ok, inv.why());
+            check((tag + ".every_part_gets_tier").c_str(), tier0.ok, tier0.why());
+            check((tag + ".floors_fit_all_parts_start").c_str(), floors.ok, floors.why());
+            check((tag + ".roomy_cap_whole_plans").c_str(), full.ok, full.why());
+        }
+        {   // one class per part
+            const std::vector<int64_t> st1 = {6656 * 1024};
+            Sweep sw;
+            for (int64_t cap = 0; cap <= 50 * kGi; cap += 211 * kMi + 777) {
+                std::vector<Part> parts = {Part({30 * kGi}, st1), Part({13 * kGi}, st1)};
+                PinSim s{cap, 0};
+                const bool ok = run_split(s, parts, true);
+                const std::string at = "cap=" + gib(cap) + " ";
+                if (ok) {
+                    sw.expect(parts[0].tp.n[0] > 0 && parts[1].tp.n[0] > 0, at + "a part got 0");
+                    sw.expect(s.held + 3 * kRoom <= cap, at + "total over the cap");
+                    sw.expect(parts[0].tp.n[0] <= parts[0].plan[0] && parts[1].tp.n[0] <= parts[1].plan[0], at + "over plan");
+                }
+                if (cap >= 43 * kGi + 128 * kMi + 3 * kRoom + kGi)
+                    sw.expect(ok && parts[0].pinned() == parts[0].planned() && parts[1].pinned() == parts[1].planned(), at + "roomy but not whole");
+                if (cap >= floors_cap(parts, 3 * kRoom) + kGi) sw.expect(ok, at + "floors fit but start failed");
+            }
+            check("dual2.single_class_per_part", sw.ok, sw.why());
+        }
+    }
+    {   // Spec: one GPU, and capped false, give v1.1.20's slots and pin bytes one for one (a 1/2/3-part uncapped split
+        // is v1.1.20's parts pinned one after another; one GPU with the cap flag set keeps the single room)
+        for (int np = 1; np <= 3; ++np) {
+            Sweep un, flag;
+            for (int64_t cap = 0; cap <= 90 * kGi; cap += 191 * kMi + 4321) {
+                for (int mode = 0; mode < 2; ++mode) {
+                    if (mode == 1 && np != 1) continue;   // the cap flag on one GPU
+                    std::vector<Part> parts = np == 1 ? std::vector<Part>{two_parts()[0]} : (np == 2 ? two_parts() : three_parts());
+                    std::vector<Part> mine = parts;
+                    PinSim a{cap, 0}, b{cap, 0};
+                    std::vector<std::vector<int64_t>> refs;
+                    bool ok_ref = true;
+                    for (Part& p : parts) {
+                        a.held += p.small;
+                        std::vector<int64_t> r;
+                        if (!old_tier(a, p.plan, p.stride, r)) {
+                            ok_ref = false;
+                            break;
+                        }
+                        refs.push_back(r);
+                    }
+                    const bool ok = run_split(b, mine, mode == 1);
+                    Sweep& sw = mode == 1 ? flag : un;
+                    const std::string at = "cap=" + gib(cap) + " ";
+                    sw.expect(ok == ok_ref, at + "start ok " + std::to_string(ok) + " vs v1.1.20 " + std::to_string(ok_ref));
+                    sw.expect(a.held == b.held, at + "held " + gib(b.held) + " vs v1.1.20 " + gib(a.held));
+                    for (size_t i = 0; i < refs.size() && ok == ok_ref; ++i) sw.expect(mine[i].tp.n == refs[i], at + "slots differ in part " + std::to_string(i));
+                }
+            }
+            check(("parity" + std::to_string(np) + ".uncapped_as_v1120").c_str(), un.ok, un.why());
+            if (np == 1) check("parity1.cap_flag_one_gpu_as_v1120", flag.ok, flag.why());
+        }
+    }
+    {   // Warm-up out of memory: an auto-sized RAM tier shrinks and the warm-up runs again (warm_retry_slots)
+        using strata::core::glmfast::kWarmRetryMax;
+        using strata::core::glmfast::warm_oom_class;
+        using strata::core::glmfast::warm_retry_slots;
+        constexpr int kOom = strata::core::glmfast::kCudaOutOfMemory;   // the header's code, not a copy of it
+        check("warmretry.oom_code_is_cuda_and_hip_out_of_memory", kOom == 2);   // cudaErrorMemoryAllocation, hipErrorOutOfMemory
+        const auto bytes = [](const std::vector<int64_t>& n, const std::vector<int64_t>& st) {
+            int64_t b = 0;
+            for (size_t c = 0; c < n.size(); ++c) b += n[c] * st[c];
+            return b;
+        };
+        check("warmretry.oom_class", warm_oom_class(kOom) && !warm_oom_class(0) && !warm_oom_class(1) &&
+                                         !warm_oom_class(700) && !warm_oom_class(719) && !warm_oom_class(-1));
+        check("warmretry.max_is_four", kWarmRetryMax == 4);
+        const std::vector<int64_t> st1 = {6656 * 1024}, least1 = {16};
+        const std::vector<int64_t> n30 = {(int64_t) (29.97 * (double) kGi) / st1[0]};   // the observed CUDA0 tier
+        const std::vector<int64_t> n13 = {(int64_t) (12.99 * (double) kGi) / st1[0]};   // ... and CUDA1's
+        {   // no retry unless auto-sized AND an out-of-memory error AND tries left
+            check("warmretry.manual_size_never_retries", warm_retry_slots(false, kOom, 0, n30, st1, least1).empty());
+            check("warmretry.other_error_never_retries", warm_retry_slots(true, 1, 0, n30, st1, least1).empty() &&
+                                                           warm_retry_slots(true, 0, 0, n30, st1, least1).empty() &&
+                                                           warm_retry_slots(true, 700, 0, n30, st1, least1).empty());
+            Sweep sw;
+            for (int t = 0; t < kWarmRetryMax; ++t) sw.expect(!warm_retry_slots(true, kOom, t, n30, st1, least1).empty(), "try " + std::to_string(t));
+            check("warmretry.tries_left_retry", sw.ok, sw.why());
+            check("warmretry.out_of_tries_gives_up", warm_retry_slots(true, kOom, kWarmRetryMax, n30, st1, least1).empty() &&
+                                                         warm_retry_slots(true, kOom, kWarmRetryMax + 7, n30, st1, least1).empty());
+            check("warmretry.negative_tries_is_zero", !warm_retry_slots(true, kOom, -3, n30, st1, least1).empty());
+        }
+        {   // the step: 1 GiB or 5% of the tier, whichever is more
+            const int64_t b30 = bytes(n30, st1), b13 = bytes(n13, st1);
+            const auto r30 = warm_retry_slots(true, kOom, 0, n30, st1, least1);
+            const auto r13 = warm_retry_slots(true, kOom, 0, n13, st1, least1);
+            const int64_t d30 = b30 - bytes(r30, st1), d13 = b13 - bytes(r13, st1);
+            check("warmretry.big_tier_loses_5pct", d30 >= b30 / 20 && d30 <= b30 / 20 + 2 * st1[0], "lost " + gib(d30) + " of " + gib(b30));
+            check("warmretry.small_tier_loses_1gib", d13 >= kGi && d13 <= kGi + 2 * st1[0], "lost " + gib(d13) + " of " + gib(b13));
+        }
+        {   // four retries from the observed tiers: each smaller, never under a floor, ends well above the floors
+            Sweep sw;
+            for (const auto& start : {n30, n13}) {
+                std::vector<int64_t> n = start;
+                for (int t = 0; t < kWarmRetryMax; ++t) {
+                    const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                    sw.expect(!r.empty() && r.size() == n.size() && r[0] < n[0] && r[0] >= least1[0], "step " + std::to_string(t));
+                    if (r.empty()) break;
+                    n = r;
+                }
+                sw.expect(bytes(n, st1) >= bytes(start, st1) * 60 / 100, "four steps lost more than 40%");
+                sw.expect(bytes(n, st1) <= bytes(start, st1) - 4 * kGi + 4 * st1[0], "four steps lost under 4 GiB");
+            }
+            check("warmretry.four_steps_shrink_and_stay_above_floor", sw.ok, sw.why());
+        }
+        {   // the floors: a tier at them cannot shrink; one just over goes to them exactly and no further
+            check("warmretry.at_floor_gives_up", warm_retry_slots(true, kOom, 0, {16}, st1, least1).empty() &&
+                                                     warm_retry_slots(true, kOom, 0, {3}, st1, least1).empty() &&
+                                                     warm_retry_slots(true, kOom, 0, {}, {}, {}).empty());
+            const auto r = warm_retry_slots(true, kOom, 0, {40}, st1, least1);
+            check("warmretry.near_floor_lands_on_floor", r.size() == 1 && r[0] == 16, r.empty() ? "empty" : std::to_string(r[0]));
+            const auto r2 = warm_retry_slots(true, kOom, 1, r, st1, least1);
+            check("warmretry.on_floor_then_gives_up", r2.empty());
+        }
+        {   // several size classes: every class shrinks in proportion, none under its own floor, none grows
+            const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024, 2 * kMi};
+            const std::vector<int64_t> lst = {16, 16, 16};
+            Sweep sw;
+            for (int64_t a = 16; a <= 6000; a += 487)
+                for (int64_t b = 16; b <= 4000; b += 311)
+                    for (int64_t c = 16; c <= 40; c += 12) {
+                        const std::vector<int64_t> n = {a, b, c};
+                        for (int t = 0; t < kWarmRetryMax; ++t) {
+                            const auto r = warm_retry_slots(true, kOom, t, n, st, lst);
+                            const std::string at = "n=" + std::to_string(a) + "/" + std::to_string(b) + "/" + std::to_string(c) + " t=" + std::to_string(t);
+                            const bool floors = a == 16 && b == 16 && c == 16;
+                            if (floors) {
+                                sw.expect(r.empty(), at + " shrank at the floors");
+                                continue;
+                            }
+                            if (r.empty()) {
+                                sw.expect(false, at + " gave up above the floors");
+                                continue;
+                            }
+                            sw.expect(r.size() == 3, at + " size");
+                            if (r.size() != 3) continue;
+                            bool less = false;
+                            for (size_t k = 0; k < 3; ++k) {
+                                sw.expect(r[k] <= n[k] && r[k] >= lst[k], at + " class " + std::to_string(k) + " " + std::to_string(r[k]));
+                                less = less || r[k] < n[k];
+                            }
+                            sw.expect(less, at + " no class shrank");
+                            sw.expect(bytes(r, st) < bytes(n, st), at + " bytes did not fall");
+                        }
+                    }
+            check("warmretry.multi_class_sweep", sw.ok, sw.why());
+        }
+        {   // a class already under its floor (a tiny class of one layer, cap 1) is left alone, the others still shrink
+            const auto r = warm_retry_slots(true, kOom, 0, {3, 4000}, {2 * kMi, 6656 * 1024}, {16, 16});
+            check("warmretry.class_under_floor_untouched", r.size() == 2 && r[0] == 3 && r[1] < 4000 && r[1] >= 16);
+        }
+        {   // degenerate inputs: nothing to shrink, or inputs that do not line up, give no retry
+            check("warmretry.zero_slots_or_zero_stride_gives_up",
+                  warm_retry_slots(true, kOom, 0, {0}, st1, least1).empty() && warm_retry_slots(true, kOom, 0, {0, 0}, {st1[0], st1[0]}, {16, 16}).empty() &&
+                      warm_retry_slots(true, kOom, 0, {500}, {0}, least1).empty());
+            check("warmretry.negative_slots_give_up", warm_retry_slots(true, kOom, 0, {-5}, st1, least1).empty());
+            check("warmretry.size_mismatch_gives_up", warm_retry_slots(true, kOom, 0, {500, 500}, st1, {16, 16}).empty() &&
+                                                          warm_retry_slots(true, kOom, 0, {500, 500}, {st1[0], st1[0]}, {16}).empty() &&
+                                                          warm_retry_slots(true, kOom, 0, {500}, st1, {16, 16}).empty());
+            const auto r0 = warm_retry_slots(true, kOom, 0, {500}, st1, {0});   // a zero floor is a floor: the tier may shrink, to 0 at most
+            check("warmretry.zero_floor_shrinks_not_below_zero", r0.size() == 1 && r0[0] >= 0 && r0[0] < 500);
+        }
+        {   // every other error code gives up, whatever the tries and the size
+            Sweep sw;
+            for (int code = -2000; code <= 2000; ++code)
+                if (code != kOom) sw.expect(warm_retry_slots(true, code, 0, n30, st1, least1).empty(), "code " + std::to_string(code));
+            for (int code : {INT_MIN, INT_MAX, 1 << 16, kOom + 256, kOom << 8})
+                sw.expect(warm_retry_slots(true, code, 0, n30, st1, least1).empty(), "code " + std::to_string(code));
+            check("warmretry.every_other_code_gives_up", sw.ok, sw.why());
+            check("warmretry.manual_size_with_any_tries_gives_up", warm_retry_slots(false, kOom, -1, n30, st1, least1).empty() &&
+                                                                       warm_retry_slots(false, kOom, kWarmRetryMax - 1, n30, st1, least1).empty());
+        }
+        {   // the tries boundary
+            check("warmretry.last_try_still_retries", !warm_retry_slots(true, kOom, kWarmRetryMax - 1, n30, st1, least1).empty());
+            check("warmretry.tries_extremes", !warm_retry_slots(true, kOom, INT_MIN, n30, st1, least1).empty() &&
+                                                  warm_retry_slots(true, kOom, INT_MAX, n30, st1, least1).empty());
+            int ran = 0;
+            std::vector<int64_t> n = n30;
+            for (int t = 0; t < 100; ++t) {
+                const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                if (r.empty()) break;
+                n = r;
+                ++ran;
+            }
+            check("warmretry.big_tier_runs_exactly_max_retries", ran == kWarmRetryMax, std::to_string(ran) + " retries");
+            ran = 0;
+            n = {40};
+            for (int t = 0; t < 100; ++t) {
+                const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                if (r.empty()) break;
+                n = r;
+                ++ran;
+            }
+            check("warmretry.near_floor_tier_stops_at_floor_before_max", ran == 1 && n[0] == 16, std::to_string(ran) + " retries, " + std::to_string(n[0]) + " slots");
+        }
+        {   // tiny tiers: one slot over the floor goes to the floor; a tier at or under its floor gives up
+            const auto a = warm_retry_slots(true, kOom, 0, {17}, st1, least1);
+            check("warmretry.one_slot_over_floor_lands_on_floor", a.size() == 1 && a[0] == 16);
+            const auto b = warm_retry_slots(true, kOom, 0, {1}, st1, {1});
+            const auto c = warm_retry_slots(true, kOom, 0, {1}, st1, {16});   // under its floor: left alone, nothing to give
+            check("warmretry.below_floor_tier_gives_up", b.empty() && c.empty());
+        }
+        {   // the step equals the margin above the floors exactly
+            const int64_t g = kGi;   // 1 GiB slots, so the step (1 GiB) is one slot
+            const auto a = warm_retry_slots(true, kOom, 0, {5}, {g}, {4});   // margin 1 slot == step: lands on the floor
+            const auto b = warm_retry_slots(true, kOom, 0, {6}, {g}, {4});   // margin 2 slots, step 1: 5
+            const auto c = warm_retry_slots(true, kOom, 0, {4}, {g}, {4});   // no margin
+            check("warmretry.step_equal_to_margin_lands_on_floor", a.size() == 1 && a[0] == 4);
+            check("warmretry.step_half_margin_loses_one_slot", b.size() == 1 && b[0] == 5, b.empty() ? "empty" : std::to_string(b[0]));
+            check("warmretry.no_margin_gives_up", c.empty());
+        }
+        {   // the 5% side of the step, in whole slots
+            const auto r = warm_retry_slots(true, kOom, 0, {100}, {kGi}, {1});   // 100 GiB: 5 GiB
+            const int64_t lost = r.empty() ? -1 : 100 - r[0];
+            check("warmretry.five_percent_step_in_whole_slots", lost >= 5 && lost <= 6, "lost " + std::to_string(lost) + " slots");
+            const auto r2 = warm_retry_slots(true, kOom, 0, {40}, {kGi}, {1});   // 5% = 2 GiB
+            const int64_t lost2 = r2.empty() ? -1 : 40 - r2[0];
+            check("warmretry.step_not_overshot_by_float_rounding", lost2 == 2, "lost " + std::to_string(lost2) + " slots (a step of 2)");
+        }
+        {   // rounding, single and several classes: the sum never goes over the target, every retry is strictly smaller,
+            // the loss is the step (at most one slot per class beyond it), the floors hold
+            Sweep sw;
+            uint64_t seed = 12345;
+            const auto rnd = [&](int64_t lo, int64_t hi) {
+                seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                return lo + (int64_t) ((seed >> 33) % (uint64_t) (hi - lo + 1));
+            };
+            for (int it = 0; it < 4000; ++it) {
+                const size_t C = (size_t) rnd(1, 4);
+                std::vector<int64_t> n(C), st(C), ls(C);
+                for (size_t c = 0; c < C; ++c) {
+                    st[c] = rnd(1, 24) * kMi * 3 / 2;
+                    ls[c] = rnd(0, 20);
+                    n[c] = ls[c] + rnd(0, c % 2 ? 3000 : 40);
+                }
+                int64_t have = 0, fl = 0;
+                for (size_t c = 0; c < C; ++c) {
+                    have += n[c] * st[c];
+                    fl += std::min(n[c], ls[c]) * st[c];
+                }
+                const std::string at = "it=" + std::to_string(it) + " C=" + std::to_string(C);
+                const auto r = warm_retry_slots(true, kOom, 0, n, st, ls);
+                if (have <= fl) {
+                    sw.expect(r.empty(), at + " retried at the floors");
+                    continue;
+                }
+                if (r.size() != C) {
+                    sw.expect(false, at + " gave up above the floors");
+                    continue;
+                }
+                const int64_t step = std::max<int64_t>(kGi, have / 20), target = std::max(fl, have - step), got = bytes(r, st);
+                int64_t slack = 0;
+                for (size_t c = 0; c < C; ++c) {
+                    sw.expect(r[c] <= n[c] && r[c] >= std::min(n[c], ls[c]), at + " class " + std::to_string(c) + " out of range");
+                    slack += st[c];
+                }
+                sw.expect(got < have, at + " not smaller");
+                sw.expect(got <= target, at + " over the target by " + std::to_string(got - target));
+                sw.expect(got >= target - slack, at + " lost far more than the step");
+            }
+            check("warmretry.rounding_sweep_sum_under_target_strictly_smaller", sw.ok, sw.why());
+        }
+        {   // one common factor: the share of its above-floor slots a class keeps agrees across classes to a slot
+            Sweep sw;
+            const std::vector<int64_t> st = {6656 * 1024, 7168 * 1024, 2 * kMi}, ls = {16, 16, 16};
+            for (int64_t a = 100; a <= 6000; a += 997)
+                for (int64_t b = 100; b <= 4000; b += 733) {
+                    const std::vector<int64_t> n = {a, b, 40};
+                    const auto r = warm_retry_slots(true, kOom, 0, n, st, ls);
+                    if (r.size() != 3) {
+                        sw.expect(false, "gave up");
+                        continue;
+                    }
+                    const double fa = (double) (r[0] - 16) / (double) (n[0] - 16), fb = (double) (r[1] - 16) / (double) (n[1] - 16);
+                    sw.expect(std::fabs(fa - fb) <= 1.0 / (double) (n[0] - 16) + 1.0 / (double) (n[1] - 16),
+                              "a=" + std::to_string(a) + " b=" + std::to_string(b) + " shares " + std::to_string(fa) + " vs " + std::to_string(fb));
+                }
+            check("warmretry.classes_shrink_by_one_common_share", sw.ok, sw.why());
+        }
+        {   // a class exactly on its floor stays, the others carry the whole step
+            const auto r = warm_retry_slots(true, kOom, 0, {16, 4000}, {2 * kMi, 6656 * 1024}, {16, 16});
+            check("warmretry.class_on_floor_untouched_others_carry_step", r.size() == 2 && r[0] == 16 && r[1] < 4000 && r[1] >= 16);
+        }
+        {   // a slot bigger than the step (2 GiB slots): one slot is still given up, never past the floor
+            const auto r = warm_retry_slots(true, kOom, 0, {10}, {2 * kGi}, {4});
+            check("warmretry.slot_bigger_than_step_still_shrinks", r.size() == 1 && r[0] < 10 && r[0] >= 4, r.empty() ? "empty" : std::to_string(r[0]));
+            const auto q = warm_retry_slots(true, kOom, 0, {5}, {2 * kGi}, {4});
+            check("warmretry.slot_bigger_than_step_one_over_floor", q.size() == 1 && q[0] == 4);
+        }
+        {   // a very big tier (32 TiB) and one whose byte count passes int64
+            const int64_t nb = int64_t{5} << 20, sb = int64_t{6656} * 1024;
+            const auto big = warm_retry_slots(true, kOom, 0, {nb}, {sb}, {16});
+            check("warmretry.huge_tier_loses_5pct", big.size() == 1 && big[0] < nb && (nb - big[0]) * sb >= nb * sb / 20 - sb);
+            const int64_t nn = int64_t{1} << 50;   // 2^50 slots of 1 MiB: 2^70 bytes
+            const auto ov = warm_retry_slots(true, kOom, 0, {nn}, {kMi}, {16});
+            check("warmretry.byte_count_overflow_is_no_silent_wrong_answer", ov.empty() || (ov.size() == 1 && ov[0] >= 16 && ov[0] < nn),
+                  ov.empty() ? "empty" : std::to_string(ov[0]));
+        }
+        {   // with scaled_slots (a split's scale, never under a floor): retries from its result keep the floor too
+            Sweep sw;
+            for (double scale : {0.01, 0.1, 0.5, 0.97, 1.0, 1.5})
+                for (int64_t plan : {10, 17, 100, 4000}) {
+                    std::vector<int64_t> n = {strata::core::glmfast::scaled_slots(plan, 16, scale)};
+                    for (int t = 0; t < kWarmRetryMax; ++t) {
+                        const auto r = warm_retry_slots(true, kOom, t, n, st1, least1);
+                        if (r.empty()) break;
+                        sw.expect(r[0] < n[0] && r[0] >= std::min<int64_t>(n[0], 16), "scale " + std::to_string(scale) + " plan " + std::to_string(plan) + " t " + std::to_string(t));
+                        n = r;
+                    }
+                }
+            check("warmretry.after_scaled_slots_keeps_floor", sw.ok, sw.why());
+        }
+        {   // a negative floor is no floor: a class never gets fewer than 0 slots
+            const auto r = warm_retry_slots(true, kOom, 0, {40}, {6656 * 1024}, {-3});
+            check("warmretry.negative_floor_never_gives_negative_slots", r.size() == 1 && r[0] >= 0 && r[0] < 40,
+                  r.empty() ? "empty" : std::to_string(r[0]));
+            const auto r2 = warm_retry_slots(true, kOom, 0, {40, 4000}, {6656 * 1024, 7168 * 1024}, {-3, -100});
+            check("warmretry.negative_floors_multi_class_never_negative",
+                  r2.size() == 2 && r2[0] >= 0 && r2[1] >= 0 && r2[0] <= 40 && r2[1] < 4000,
+                  r2.size() != 2 ? "empty" : std::to_string(r2[0]) + "," + std::to_string(r2[1]));
+        }
+    }
+    {   // A split's warm-ups and the re-pins of their retries (WarmGate): no re-pin while any part warms up, two parts
+        // retrying at once take turns (no deadlock), a waiting re-pin goes before a warm-up not yet begun, one part never
+        // waits.  A deadlock is a check failing on a timeout (the stuck threads are left behind, the gate leaked)
+        using strata::core::glmfast::WarmGate;
+        using Clock = std::chrono::steady_clock;
+        const auto wait_for = [](const std::atomic<int>& v, int want, int ms) {
+            const auto end = Clock::now() + std::chrono::milliseconds(ms);
+            while (v.load() != want && Clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return v.load() == want;
+        };
+        const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        // a thread that said it started (started == 1, just before its blocking call) and still has no answer (r == -1)
+        // 50 ms later: it blocks there.  (The time counts from its start, not from its spawn: a slow spawn is no pass)
+        const auto blocked = [&](const std::atomic<int>& started, const std::atomic<int>& r) {
+            if (!wait_for(started, 1, 2000)) return false;
+            nap(50);
+            return r.load() == -1;
+        };
+        {
+            auto* g = new WarmGate;
+            auto* done = new std::atomic<int>{0};
+            std::thread([g, done] {
+                for (int i = 0; i < 5; ++i) {
+                    g->begin_warm();
+                    g->end_warm();
+                    g->begin_repin();
+                    g->end_repin();
+                }
+                g->begin_warm();
+                g->end_warm();
+                done->store(1);
+            }).detach();
+            check("warmgate.one_part_never_waits", wait_for(*done, 1, 2000));
+        }
+        {
+            auto* g = new WarmGate;
+            auto* repinned = new std::atomic<int>{0};
+            g->begin_warm();   // another part warms up
+            std::thread([g, repinned] {
+                g->begin_repin();
+                repinned->store(1);
+                g->end_repin();
+            }).detach();
+            nap(100);
+            const bool waited = repinned->load() == 0;
+            g->end_warm();
+            check("warmgate.repin_waits_for_another_parts_warm", waited && wait_for(*repinned, 1, 2000),
+                  waited ? "never re-pinned" : "re-pinned during the warm-up");
+        }
+        {
+            auto* g = new WarmGate;
+            auto* warmed = new std::atomic<int>{0};
+            g->begin_repin();   // another part re-pins
+            std::thread([g, warmed] {
+                g->begin_warm();
+                warmed->store(1);
+                g->end_warm();
+            }).detach();
+            nap(100);
+            const bool waited = warmed->load() == 0;
+            g->end_repin();
+            check("warmgate.warm_waits_for_another_parts_repin", waited && wait_for(*warmed, 1, 2000),
+                  waited ? "never warmed" : "warmed during the re-pin");
+        }
+        {
+            auto* g = new WarmGate;
+            auto* seq = new std::atomic<int>{0};
+            auto* repin_at = new std::atomic<int>{-1};
+            auto* warm_at = new std::atomic<int>{-1};
+            g->begin_warm();   // part A warms up
+            std::thread([g, seq, repin_at] {   // part B's retry waits for A
+                g->begin_repin();
+                repin_at->store(seq->fetch_add(1));
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                g->end_repin();
+            }).detach();
+            nap(50);
+            std::thread([g, seq, warm_at] {   // part C's warm-up comes after B asked
+                g->begin_warm();
+                warm_at->store(seq->fetch_add(1));
+                g->end_warm();
+            }).detach();
+            nap(50);
+            const int a_end = seq->fetch_add(1);
+            g->end_warm();
+            const bool all = wait_for(*seq, 3, 2000);
+            check("warmgate.waiting_repin_goes_before_a_new_warm",
+                  all && a_end == 0 && repin_at->load() == 1 && warm_at->load() == 2,
+                  "A's warm ended " + std::to_string(a_end) + ", repin " + std::to_string(repin_at->load()) + ", warm " +
+                      std::to_string(warm_at->load()));
+        }
+        for (int parts : {2, 3}) {   // parts warm up and retry at once, kWarmRetryMax times each
+            struct S {
+                WarmGate g;
+                std::atomic<int> warm_now{0}, repin_now{0}, overlaps{0}, done{0}, ready{0};
+            };
+            auto* s = new S;
+            for (int p = 0; p < parts; ++p)
+                std::thread([s, p, parts] {
+                    s->ready.fetch_add(1);
+                    while (s->ready.load() < parts) std::this_thread::yield();   // every part fails at once
+                    uint64_t seed = 99 + (uint64_t) p;
+                    const auto ms = [&] {
+                        seed = seed * 6364136223846793005ULL + 1442695040888963407ULL;
+                        return (int) ((seed >> 33) % 4);
+                    };
+                    for (int t = 0; t <= strata::core::glmfast::kWarmRetryMax; ++t) {
+                        s->g.begin_warm();
+                        s->warm_now.fetch_add(1);
+                        if (s->repin_now.load() != 0) s->overlaps.fetch_add(1);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(ms()));
+                        s->warm_now.fetch_sub(1);
+                        s->g.end_warm();
+                        if (t == strata::core::glmfast::kWarmRetryMax) break;
+                        s->g.begin_repin();
+                        if (s->repin_now.fetch_add(1) != 0 || s->warm_now.load() != 0) s->overlaps.fetch_add(1);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(ms()));
+                        if (s->warm_now.load() != 0) s->overlaps.fetch_add(1);
+                        s->repin_now.fetch_sub(1);
+                        s->g.end_repin();
+                    }
+                    s->done.fetch_add(1);
+                }).detach();
+            const bool all = wait_for(s->done, parts, 10000);
+            const std::string tag = "warmgate.parts" + std::to_string(parts);
+            check((tag + "_retrying_at_once_never_deadlock").c_str(), all, std::to_string(s->done.load()) + " of " + std::to_string(parts) + " done");
+            check((tag + "_repin_never_overlaps_a_warm_or_repin").c_str(), s->overlaps.load() == 0,
+                  std::to_string(s->overlaps.load()) + " overlaps");
+        }
+        // an aborted split (a part failed): every waiter of the gate wakes and takes no turn, later turns are refused
+        {
+            auto* g = new WarmGate;
+            auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
+            g->begin_warm();   // another part warms up: the re-pin waits
+            std::thread([g, r, started] {
+                started->store(1);
+                r->store(g->begin_repin() ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
+            g->abort();
+            check("warmgate.abort_wakes_a_waiting_repin", waited && wait_for(*r, 0, 2000),
+                  waited ? "still waiting or took the turn: " + std::to_string(r->load()) : "did not wait");
+            g->end_warm();
+        }
+        {
+            auto* g = new WarmGate;
+            auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
+            g->begin_repin();   // another part re-pins: the warm-up waits
+            std::thread([g, r, started] {
+                started->store(1);
+                r->store(g->begin_warm() ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
+            g->abort();
+            check("warmgate.abort_wakes_a_waiting_warm", waited && wait_for(*r, 0, 2000),
+                  waited ? "still waiting or took the turn: " + std::to_string(r->load()) : "did not wait");
+            g->end_repin();
+        }
+        {
+            WarmGate g;
+            g.abort();
+            g.abort();   // (twice: as once)
+            bool turn_ok = true;
+            {
+                strata::core::glmfast::WarmTurn t(&g, false);
+                turn_ok = t.ok();
+            }
+            strata::core::glmfast::WarmTurn none(nullptr, true);   // one GPU: no gate, always its turn
+            check("warmgate.after_abort_no_turn", !g.begin_warm() && !g.begin_repin() && !turn_ok && none.ok() &&
+                                                      g.aborted());
+        }
+    }
+    {   // A parallel split's turns (SplitSync): the plans and the pins in part order, and an abort when a part fails -
+        // every wait wakes and says so, the failures are kept in the order they came (a part stopped by the abort is no
+        // failure of its own), and the warm gate is aborted with it
+        using strata::core::glmfast::SplitSync;
+        using Clock = std::chrono::steady_clock;
+        const auto wait_for = [](const std::atomic<int>& v, int want, int ms) {
+            const auto end = Clock::now() + std::chrono::milliseconds(ms);
+            while (v.load() != want && Clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return v.load() == want;
+        };
+        const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        const auto blocked = [&](const std::atomic<int>& started, const std::atomic<int>& r) {   // (as the gate's)
+            if (!wait_for(started, 1, 2000)) return false;
+            nap(50);
+            return r.load() == -1;
+        };
+        {
+            SplitSync s(2);
+            bool ok = s.wait(0) && s.wait_pin(0);
+            s.pass(0);
+            ok = ok && s.wait(1);
+            s.pass_pin(0);
+            ok = ok && s.wait_pin(1);
+            s.finish(1, true);
+            ok = ok && s.wait(2) && s.wait_pin(2);
+            check("splitsync.turns_in_order_without_abort", ok && !s.aborted() && s.failures().empty() &&
+                                                                 !s.gate.aborted());
+        }
+        {
+            auto* s = new SplitSync(2);
+            auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
+            std::thread([s, r, started] {   // part 1 waits for part 0's plan
+                started->store(1);
+                r->store(s->wait(1) ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
+            s->fail(0);
+            check("splitsync.abort_wakes_wait", waited && wait_for(*r, 0, 2000), std::to_string(r->load()));
+        }
+        {
+            auto* s = new SplitSync(2);
+            auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
+            s->pass_pin(0);
+            std::thread([s, r, started] {   // part 0 waits for every pin
+                started->store(1);
+                r->store(s->wait_pin(2) ? 1 : 0);
+            }).detach();
+            const bool waited = blocked(*started, *r);
+            s->fail(1);   // part 1's pin was refused
+            check("splitsync.abort_wakes_wait_pin", waited && wait_for(*r, 0, 2000), std::to_string(r->load()));
+        }
+        {
+            SplitSync s(3);
+            s.finish(0, true);
+            s.finish(2, false);   // (a failed part's end aborts and records it)
+            check("splitsync.after_abort_every_wait_says_so", !s.wait(0) && !s.wait(1) && !s.wait_pin(0) &&
+                                                                  !s.wait_pin(3) && s.aborted() && s.gate.aborted() &&
+                                                                  s.failures() == std::vector<int>({2}));
+        }
+        {
+            SplitSync s(3);
+            s.fail(1);       // part 1 fails first
+            s.stopped(0);    // part 0 stops on the abort ...
+            s.finish(0, false);   // ... and ends failed: not a failure of its own
+            s.fail(2);       // part 2 failed of its own, later
+            s.fail(1);       // (twice: once)
+            s.finish(1, false);
+            s.finish(2, false);
+            const std::vector<int> f = s.failures();
+            check("splitsync.failures_in_order_without_stopped_parts", f == std::vector<int>({1, 2}),
+                  f.empty() ? "none" : std::to_string(f[0]) + (f.size() > 1 ? "," + std::to_string(f[1]) : ""));
+        }
+        {
+            SplitSync s(2);
+            s.stopped(1);   // (a stop without an abort: none - the record keeps it, nothing else)
+            s.fail(0);
+            check("splitsync.first_failure_is_the_first_reported", s.failures() == std::vector<int>({0}));
+        }
+        // the 2-GPU start that hid its cause: part 0 pins its tier, part 1's pin is refused.  Part 0 waits for every pin
+        // before its warm-up (a pinning cap) and must stop there, never warm up; the failure kept is part 1's
+        {
+            Sweep sw;
+            for (int round = 0; round < 50; ++round) {
+                struct St {
+                    SplitSync s{2};
+                    std::atomic<int> warmed{0}, done{0}, stopped{0};
+                };
+                auto* st = new St;
+                std::thread([st] {   // part 0
+                    bool ok = st->s.wait(0);
+                    st->s.pass(0);
+                    ok = ok && st->s.wait(2) && st->s.wait_pin(0);
+                    if (ok) st->s.pass_pin(0);
+                    ok = ok && st->s.wait_pin(2);
+                    if (ok) {
+                        strata::core::glmfast::WarmTurn t(&st->s.gate, false);
+                        if (t.ok()) st->warmed.fetch_add(1);
+                    } else {
+                        st->s.stopped(0);
+                        st->stopped.fetch_add(1);
+                    }
+                    st->s.finish(0, ok);
+                    st->done.fetch_add(1);
+                }).detach();
+                std::thread([st, round] {   // part 1
+                    bool ok = st->s.wait(1);
+                    st->s.pass(1);
+                    ok = ok && st->s.wait(2) && st->s.wait_pin(1);
+                    if (round % 2) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    st->s.finish(1, false);   // the pin refused (the wrapper passes its pin turn)
+                    st->done.fetch_add(1);
+                }).detach();
+                const bool all = wait_for(st->done, 2, 5000);
+                sw.expect(all && st->warmed.load() == 0 && st->stopped.load() == 1 &&
+                              st->s.failures() == std::vector<int>({1}),
+                          "round " + std::to_string(round) + ": done " + std::to_string(st->done.load()) + ", warmed " +
+                              std::to_string(st->warmed.load()) + ", stopped " + std::to_string(st->stopped.load()));
+                if (!all) break;
+            }
+            check("splitsync.pin_refused_on_part1_stops_part0_before_its_warm", sw.ok, sw.why());
+        }
+        // 2-4 parts, one part fails at one of its steps (before its plan, its pin, its warm-up, or after a warm-up), the
+        // others plan, pin, warm up and retry under the gate: every thread ends (no deadlock), a part that saw the abort
+        // starts no warm-up or re-pin, and the first failure kept is the failing part's
+        {
+            struct Rs {
+                SplitSync s;
+                std::atomic<int> done{0}, late{0};
+                explicit Rs(int n) : s(n) {}
+            };
+            Sweep sw;
+            for (int round = 0; round < 90; ++round) {
+                const int parts = 2 + round % 3, bad = round % parts, at = (round / 3) % 5;
+                auto* rs = new Rs(parts);
+                for (int p = 0; p < parts; ++p)
+                    std::thread([rs, p, parts, bad, at] {
+                        SplitSync& s = rs->s;
+                        int step = 0;
+                        bool failed = false;   // this part's own failure
+                        const auto fails_here = [&] { return failed = failed || (p == bad && step++ == at); };
+                        bool ok = !fails_here() && s.wait(p);
+                        s.pass(p);
+                        ok = ok && !fails_here() && s.wait(parts) && s.wait_pin(p);
+                        if (ok) s.pass_pin(p);
+                        ok = ok && !fails_here() && s.wait_pin(parts);
+                        for (int t = 0; ok && t < 3; ++t) {
+                            {
+                                const bool seen = s.aborted();
+                                strata::core::glmfast::WarmTurn w(&s.gate, false);
+                                if (!w.ok()) {
+                                    ok = false;
+                                    break;
+                                }
+                                if (seen) rs->late.fetch_add(1);   // a warm-up begun after its part saw the abort
+                                std::this_thread::sleep_for(std::chrono::microseconds(200));
+                            }
+                            if (fails_here() || s.aborted()) {
+                                ok = false;
+                                break;
+                            }
+                            const bool seen = s.aborted();
+                            strata::core::glmfast::WarmTurn r(&s.gate, true);
+                            if (!r.ok()) {
+                                ok = false;
+                                break;
+                            }
+                            if (seen) rs->late.fetch_add(1);
+                        }
+                        if (!ok && !failed) s.stopped(p);
+                        s.finish(p, ok);
+                        rs->done.fetch_add(1);
+                    }).detach();
+                const bool all = wait_for(rs->done, parts, 5000);
+                const std::vector<int> f = rs->s.failures();
+                const std::string r = "round " + std::to_string(round) + " (" + std::to_string(parts) + " parts, part " +
+                                      std::to_string(bad) + " fails at step " + std::to_string(at) + ")";
+                sw.expect(all, r + ": " + std::to_string(rs->done.load()) + " ended");
+                if (!all) break;
+                sw.expect(f.size() == 1 && f.front() == bad, r + ": failures " + std::to_string(f.size()) + ", first " +
+                                                                 std::to_string(f.empty() ? -1 : f.front()));
+                sw.expect(rs->late.load() == 0, r + ": " + std::to_string(rs->late.load()) + " turns after the abort");
+            }
+            check("splitsync.random_failure_never_deadlocks_and_names_the_failing_part", sw.ok, sw.why());
+        }
+    }
+    {   // the start's line for a RAM tier short of pinned memory (serve/server.py's ram_oom_of reads it back)
+        using strata::core::glmfast::ram_tier_oom_line;
+        check("oomline.format", ram_tier_oom_line((int64_t) (42.71 * (double) kGi), false) ==
+                                    "glm fast: RAM-TIER-OOM total_gb=42.71 manual=0",
+              ram_tier_oom_line((int64_t) (42.71 * (double) kGi), false));
+        check("oomline.manual_and_rounding", ram_tier_oom_line(41 * kGi + kGi / 2, true) ==
+                                                 "glm fast: RAM-TIER-OOM total_gb=41.50 manual=1" &&
+                                             ram_tier_oom_line(0, false) == "glm fast: RAM-TIER-OOM total_gb=0.00 manual=0",
+              ram_tier_oom_line(41 * kGi + kGi / 2, true));
+        check("oomline.negative_is_zero", ram_tier_oom_line(-5, false) == "glm fast: RAM-TIER-OOM total_gb=0.00 manual=0");
+    }
+    {   // gaps: the order and the bookkeeping of SplitSync failures, its odd inputs, and the gate after an abort
+        using strata::core::glmfast::SplitSync;
+        using strata::core::glmfast::WarmGate;
+        using strata::core::glmfast::WarmTurn;
+        using Clock = std::chrono::steady_clock;
+        const auto wait_for = [](const std::atomic<int>& v, int want, int ms) {
+            const auto end = Clock::now() + std::chrono::milliseconds(ms);
+            while (v.load() != want && Clock::now() < end) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return v.load() == want;
+        };
+        const auto nap = [](int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); };
+        const auto blocked = [&](const std::atomic<int>& started, const std::atomic<int>& r) {   // (as the gate's)
+            if (!wait_for(started, 1, 2000)) return false;
+            nap(50);
+            return r.load() == -1;
+        };
+        {
+            SplitSync s(4);
+            s.fail(3);
+            s.fail(1);
+            s.fail(3);   // (again: once)
+            s.fail(0);
+            s.fail(1);
+            check("splitsync.gap.four_parts_failures_in_arrival_order", s.failures() == std::vector<int>({3, 1, 0}));
+        }
+        {
+            SplitSync s(4);
+            s.fail(2);
+            s.stopped(0);
+            s.stopped(3);
+            s.finish(0, false);   // stopped by the abort: no failure
+            s.finish(3, false);
+            s.finish(1, false);   // part 1 never said it stopped: its own failure, after part 2
+            check("splitsync.gap.four_parts_stopped_parts_left_out", s.failures() == std::vector<int>({2, 1}));
+        }
+        {
+            SplitSync s(3);
+            s.stopped(1);
+            s.fail(1);   // stopped first, then fail: still not its own failure
+            check("splitsync.gap.stopped_before_fail_is_not_a_failure", s.failures().empty() && s.aborted() &&
+                                                                          s.gate.aborted());
+        }
+        {
+            SplitSync s(2);
+            s.fail(-1);
+            s.fail(2);
+            s.fail(99);
+            s.stopped(-3);
+            s.stopped(17);
+            check("splitsync.gap.out_of_range_part_aborts_without_a_record",
+                  s.aborted() && s.gate.aborted() && s.failures().empty() && !s.wait(0) && !s.wait_pin(0));
+        }
+        {
+            SplitSync zero(0), neg(-4);
+            const bool before = zero.parts() == 0 && neg.parts() == 0 && zero.wait(0) && neg.wait_pin(0);
+            zero.fail(0);
+            neg.finish(0, true);
+            check("splitsync.gap.no_parts_is_harmless", before && zero.aborted() && zero.failures().empty() &&
+                                                           !neg.aborted() && neg.failures().empty());
+        }
+        {   // passes out of range or twice change no turn; a turn passes only when every part before it has
+            auto* s = new SplitSync(3);
+            auto* r = new std::atomic<int>{-1};
+            s->pass(-1);
+            s->pass(3);
+            s->pass(0);
+            s->pass(0);
+            auto* started = new std::atomic<int>{0};
+            std::thread([s, r, started] {   // needs parts 1 and 2
+                started->store(1);
+                r->store(s->wait(3) ? 1 : 0);
+            }).detach();
+            const bool held = blocked(*started, *r);
+            s->pass(2);   // out of order: part 1 is still missing
+            nap(50);   // (the waiter has long been waiting: a wrong wake-up would show within this)
+            const bool still = r->load() == -1;
+            s->pass(1);
+            check("splitsync.gap.turn_passes_only_in_part_order", held && still && wait_for(*r, 1, 2000),
+                  std::to_string(r->load()));
+        }
+        {   // finish() in any order: the turns of a part that never reached them pass, and the later parts go on
+            auto* s = new SplitSync(3);
+            auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
+            std::thread([s, r, started] {
+                started->store(1);
+                r->store(s->wait(3) && s->wait_pin(3) ? 1 : 0);
+            }).detach();
+            s->finish(2, true);
+            s->finish(0, true);
+            const bool held = blocked(*started, *r);   // part 1 has not ended
+            s->finish(1, true);
+            check("splitsync.gap.finish_out_of_order_passes_every_turn", held && wait_for(*r, 1, 2000) &&
+                                                                              !s->aborted() && s->failures().empty(),
+                  std::to_string(r->load()));
+        }
+        {   // one abort wakes a waiter at every point at once: the plan turn, the pin turn, the warm-up and the re-pin
+            Sweep sw;
+            for (int round = 0; round < 20; ++round) {
+                struct St {
+                    SplitSync s{3};
+                    std::atomic<int> back{0}, ok{0}, started{0};
+                };
+                auto* st = new St;
+                WarmGate& g = st->s.gate;
+                g.begin_repin();   // the gate is busy: a warm-up and a re-pin both wait
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.wait(2) ? 1 : 0; st->back.fetch_add(1); }).detach();
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.wait_pin(2) ? 1 : 0; st->back.fetch_add(1); }).detach();
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.gate.begin_warm() ? 1 : 0; st->back.fetch_add(1); }).detach();
+                std::thread([st] { st->started.fetch_add(1); st->ok += st->s.gate.begin_repin() ? 1 : 0; st->back.fetch_add(1); }).detach();
+                const bool all_started = wait_for(st->started, 4, 2000);
+                nap(20);   // (from their start: each has reached its wait)
+                const int early = all_started ? st->back.load() : -1;
+                st->s.fail(1);
+                const bool all = wait_for(st->back, 4, 3000);
+                sw.expect(early == 0 && all && st->ok.load() == 0 && st->s.failures() == std::vector<int>({1}),
+                          "round " + std::to_string(round) + ": early " + std::to_string(early) + ", back " +
+                              std::to_string(st->back.load()) + ", took a turn " + std::to_string(st->ok.load()));
+                if (!all) break;
+                g.end_repin();
+            }
+            check("splitsync.gap.one_abort_wakes_all_four_wait_points", sw.ok, sw.why());
+        }
+        {   // an abort wins over a turn that frees up right after: the waiting re-pin does not take it
+            Sweep sw;
+            for (int round = 0; round < 30; ++round) {
+                auto* g = new WarmGate;
+                auto* r = new std::atomic<int>{-1};
+                g->begin_warm();
+                std::thread([g, r] { r->store(g->begin_repin() ? 1 : 0); }).detach();
+                nap(10);
+                g->abort();
+                g->end_warm();   // (the free turn comes after the abort)
+                sw.expect(wait_for(*r, 0, 2000), "round " + std::to_string(round) + ": " + std::to_string(r->load()));
+            }
+            check("warmgate.gap.abort_beats_a_turn_that_frees_up", sw.ok, sw.why());
+        }
+        {   // a turn held when the abort comes runs on and is given back; the gate stays aborted and refuses the next
+            WarmGate g;
+            bool inside_ok = false, again = true, again_repin = true, aborted_in = false;
+            {
+                WarmTurn t(&g, false);
+                inside_ok = t.ok();
+                g.abort();
+                aborted_in = g.aborted();
+            }
+            {
+                WarmTurn t(&g, false);
+                again = t.ok();
+            }
+            {
+                WarmTurn t(&g, true);
+                again_repin = t.ok();
+            }
+            check("warmgate.gap.held_turn_runs_on_after_abort_and_the_next_is_refused",
+                  inside_ok && aborted_in && !again && !again_repin && g.aborted());
+        }
+        {   // (no abort) a turn is given back when its WarmTurn's scope ends: the re-pin waiting on it goes on
+            auto* g = new WarmGate;
+            auto* r = new std::atomic<int>{-1};
+            auto* started = new std::atomic<int>{0};
+            bool waited = false;
+            {
+                WarmTurn t(g, false);
+                std::thread([g, r, started] {
+                    started->store(1);
+                    const bool got = g->begin_repin();
+                    r->store(got ? 1 : 0);
+                    if (got) g->end_repin();
+                }).detach();
+                waited = blocked(*started, *r);
+            }
+            check("warmgate.gap.turn_given_back_when_its_scope_ends", waited && wait_for(*r, 1, 2000),
+                  std::to_string(r->load()));
+        }
+        {   // without an abort two warm-ups share the gate
+            WarmGate g;
+            WarmTurn a(&g, false);
+            WarmTurn b(&g, false);
+            check("warmgate.gap.two_warms_share_without_abort", a.ok() && b.ok() && !g.aborted());
+        }
+    }
+    {   // the golden samples the launcher's parser reads too (tests/ram_tier_oom_golden.txt; serve/test_launch_retry.py):
+        // a format change on one side alone fails a test
+        using strata::core::glmfast::ram_tier_oom_line;
+        std::string dir = __FILE__;
+        const size_t cut = dir.find_last_of("/\\");
+        dir = cut == std::string::npos ? "." : dir.substr(0, cut);
+        std::ifstream f(dir + "/ram_tier_oom_golden.txt");
+        Sweep sw;
+        int rows = 0;
+        for (std::string row; std::getline(f, row);) {
+            if (!row.empty() && row.back() == '\r') row.pop_back();
+            if (row.empty() || row[0] == '#') continue;
+            std::istringstream in(row);
+            std::string bytes, manual, gb, line;
+            std::getline(in, bytes, '\t');
+            std::getline(in, manual, '\t');
+            std::getline(in, gb, '\t');
+            std::getline(in, line);
+            const std::string got = ram_tier_oom_line(std::stoll(bytes), manual == "1");
+            sw.expect(got == line, row + " -> " + got);
+            ++rows;
+        }
+        check("oomline.golden_samples", rows >= 5 && sw.ok,   // (no file, or too few rows: a failure too)
+              rows < 5 ? dir + "/ram_tier_oom_golden.txt: " + std::to_string(rows) + " rows" : sw.why());
+    }
+    {   // the start's line, further: units, rounding and the reading side's shape
+        using strata::core::glmfast::ram_tier_oom_line;
+        check("oomline.gap.exactly_one_gib", ram_tier_oom_line(kGi, false) == "glm fast: RAM-TIER-OOM total_gb=1.00 manual=0",
+              ram_tier_oom_line(kGi, false));
+        check("oomline.gap.a_byte_short_of_a_gib_rounds_to_1_00", ram_tier_oom_line(kGi - 1, true) ==
+                                                                       "glm fast: RAM-TIER-OOM total_gb=1.00 manual=1");
+        check("oomline.gap.rounds_to_two_decimals", ram_tier_oom_line((int64_t) (1.004 * (double) kGi), false) ==
+                                                         "glm fast: RAM-TIER-OOM total_gb=1.00 manual=0" &&
+                                                     ram_tier_oom_line((int64_t) (1.006 * (double) kGi), false) ==
+                                                         "glm fast: RAM-TIER-OOM total_gb=1.01 manual=0",
+              ram_tier_oom_line((int64_t) (1.006 * (double) kGi), false));
+        check("oomline.gap.not_decimal_gb", ram_tier_oom_line(1000000000, false) ==
+                                                "glm fast: RAM-TIER-OOM total_gb=0.93 manual=0",
+              ram_tier_oom_line(1000000000, false));
+        {
+            const std::string l = ram_tier_oom_line(INT64_MAX, true);
+            check("oomline.gap.int64_max_fits_the_buffer",
+                  l.rfind("glm fast: RAM-TIER-OOM total_gb=8589934592.00", 0) == 0 && l.size() < 95 && l.back() == '1', l);
+        }
+        {
+            Sweep sw;   // what the reader's shape takes back: the total (to 0.005 GB) and the flag
+            for (const int64_t b : {int64_t{0}, int64_t{1}, kMi, 256 * kMi, kGi, 41 * kGi + kGi / 2,
+                                    (int64_t) (42.71 * (double) kGi), 64 * kGi, 1024 * kGi}) {
+                for (const bool man : {false, true}) {
+                    const std::string l = ram_tier_oom_line(b, man);
+                    double t = -1;
+                    int m = -1;
+                    char tail = 0;
+                    const int n = std::sscanf(l.c_str(), "glm fast: RAM-TIER-OOM total_gb=%lf manual=%d%c", &t, &m, &tail);
+                    sw.expect(n == 2 && m == (man ? 1 : 0) && std::fabs(t - (double) b / (double) kGi) <= 0.0051 &&
+                                  l.find('\n') == std::string::npos,
+                              l);
+                }
+            }
+            check("oomline.gap.reads_back", sw.ok, sw.why());
+        }
+    }
+    {   // STRATA_GLM_PIN_DIAG's line: always a time in the series, what is held and free, and the probe named as one
+        using strata::core::glmfast::pin_diag_text;
+        check("pindiag.series_point_with_probe",
+              pin_diag_text(1, "before-tier", 0.0, 3 * kGi / 2, 12.25, 1) ==
+                  "glm fast: CUDA1 pin-diag before-tier t=0 held=1.50 availphys=12.25 probe256=1",
+              pin_diag_text(1, "before-tier", 0.0, 3 * kGi / 2, 12.25, 1));
+        check("pindiag.refused_probe_and_no_availphys",
+              pin_diag_text(0, "after-refusal", 0.5, 0, -1.0, 0) ==
+                  "glm fast: CUDA0 pin-diag after-refusal t=0.5 held=0.00 availphys=-1 probe256=0",
+              pin_diag_text(0, "after-refusal", 0.5, 0, -1.0, 0));
+        check("pindiag.not_probed",
+              pin_diag_text(0, "after-unpin", 5.0, 40 * kGi, 3.0, -1) ==
+                  "glm fast: CUDA0 pin-diag after-unpin t=5 held=40.00 availphys=3.00 probe256=-",
+              pin_diag_text(0, "after-unpin", 5.0, 40 * kGi, 3.0, -1));
+    }
+    {   // a split part's load that ends anywhere but its success aborts the split there and then (SplitFailOnExit): the
+        // other parts stop at their next turn or phase boundary, not after loading all their weights
+        using strata::core::glmfast::SplitFailOnExit;
+        using strata::core::glmfast::SplitSync;
+        {
+            SplitSync s(2);
+            { SplitFailOnExit g(&s, 1); }   // (a failure exit: the VRAM pool, a file read, the sampler buffer)
+            check("splitfailexit.failure_exit_aborts_and_records", s.aborted() && s.gate.aborted() &&
+                                                                       s.failures() == std::vector<int>({1}) && !s.wait(0));
+        }
+        {
+            SplitSync s(2);
+            {
+                SplitFailOnExit g(&s, 0);
+                g.dismiss();   // the load succeeded
+            }
+            check("splitfailexit.success_does_not_abort", !s.aborted() && s.failures().empty());
+        }
+        {
+            SplitSync s(2);
+            s.fail(1);
+            s.stopped(0);   // part 0 stopped at a phase boundary on part 1's abort
+            { SplitFailOnExit g(&s, 0); }
+            check("splitfailexit.a_stopped_part_is_no_failure", s.failures() == std::vector<int>({1}));
+        }
+        { SplitFailOnExit none(nullptr, 0); }   // (one GPU, or the sequential split: nothing to abort)
+    }
+    {   // a split start's end when a part failed (split_start_end): the earliest failure's error and the later ones after
+        // "; then ", and the RAM-TIER-OOM line only when that earliest failure was short of pinned memory
+        using strata::core::glmfast::split_start_end;
+        using strata::core::glmfast::SplitPartEnd;
+        const auto part = [](bool ok, const char* err, int64_t try_b, bool manual, bool oom) {
+            SplitPartEnd p;
+            p.ok = ok;
+            p.err = err;
+            p.tier_try_b = try_b;
+            p.tier_manual = manual;
+            p.tier_oom = oom;
+            return p;
+        };
+        {
+            const auto e = split_start_end({}, {});
+            check("splitend.empty_is_no_failure", !e.failed && e.err.empty() && e.oom_line.empty());
+            const auto ok2 = split_start_end({}, {part(true, "", 20 * kGi, false, false), part(true, "", 20 * kGi, true, false)});
+            check("splitend.all_ok_is_no_failure", !ok2.failed && ok2.err.empty() && ok2.oom_line.empty());
+        }
+        {   // part 1's pin refused first; part 0 stopped on the abort (not in failures), part 2 failed of its own after
+            const auto e = split_start_end({1, 2}, {part(false, "CUDA0 stopped", 21 * kGi, false, true),
+                                                    part(false, "CUDA1 refused", 20 * kGi, false, true),
+                                                    part(false, "CUDA2 other", -1, false, false)});
+            check("splitend.earliest_then_later_without_the_stopped_part", e.failed && e.err == "CUDA1 refused; then CUDA2 other",
+                  e.err);
+            check("splitend.total_sums_every_part_and_unset_tries_count_zero",
+                  e.oom_line == "glm fast: RAM-TIER-OOM total_gb=41.00 manual=0", e.oom_line);
+        }
+        {   // the earliest failure was not short of pinned memory: no line, even when a later one was
+            const auto e = split_start_end({0, 1}, {part(false, "CUDA0 file", 10 * kGi, false, false),
+                                                    part(false, "CUDA1 refused", 10 * kGi, false, true)});
+            check("splitend.earliest_not_oom_no_line", e.failed && e.err == "CUDA0 file; then CUDA1 refused" &&
+                                                           e.oom_line.empty(), e.oom_line);
+        }
+        {   // a manual part among auto ones: the whole start is manual; negative tries count 0
+            const auto e = split_start_end({0}, {part(false, "CUDA0 refused", 30 * kGi, false, true),
+                                                 part(true, "", -7, true, false), part(true, "", kGi / 2, false, false)});
+            check("splitend.manual_mixed_with_auto_is_manual",
+                  e.oom_line == "glm fast: RAM-TIER-OOM total_gb=30.50 manual=1", e.oom_line);
+        }
+        {   // no failures recorded (the sequential load, or a failure before the split's turns): the first part not ok
+            const auto e = split_start_end({}, {part(true, "", 8 * kGi, false, false), part(false, "CUDA1 refused", 4 * kGi, false, true),
+                                                part(false, "CUDA2 late", 4 * kGi, false, false)});
+            check("splitend.first_not_ok_stands_for_the_failures", e.failed && e.err == "CUDA1 refused" &&
+                                                                       e.oom_line == "glm fast: RAM-TIER-OOM total_gb=16.00 manual=0",
+                  e.err + " | " + e.oom_line);
+            const auto r = split_start_end({-1, 5}, {part(true, "", 0, false, false), part(false, "CUDA1 x", 0, false, false)});
+            check("splitend.out_of_range_failures_are_ignored", r.failed && r.err == "CUDA1 x", r.err);
+        }
+    }
+    {   // how a part's RAM tier was sized: manual (the RAM-TIER-OOM line's manual=1) only for a size not the engine's own
+        // choice; a staging-only tier the engine chose itself is not manual, and it never shrinks in-engine either
+        using strata::core::glmfast::ram_tier_sizing;
+        const auto flags = [](strata::core::glmfast::RamTierSizing s) {
+            return std::string("manual=") + (s.manual ? "1" : "0") + " auto=" + (s.auto_sized ? "1" : "0");
+        };
+        const auto st = ram_tier_sizing(true, false, false, false);
+        check("tiersizing.staging_only_is_not_manual", !st.manual && !st.auto_sized, flags(st));
+        const auto au = ram_tier_sizing(false, false, false, false);
+        check("tiersizing.engine_sized_is_auto", !au.manual && au.auto_sized, flags(au));
+        bool each = true;
+        std::string why;
+        for (int k = 0; k < 3; ++k)
+            for (const bool staging : {false, true}) {
+                const auto s = ram_tier_sizing(staging, k == 0, k == 1, k == 2);
+                if (!s.manual || s.auto_sized) each = false, why += flags(s) + " ";
+            }
+        check("tiersizing.user_size_budget_or_resident_is_manual", each, why);
+    }
+    std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
+    if (g_bad) return 1;
     std::puts("GLM memory policy checks passed (CPU only)");
 }

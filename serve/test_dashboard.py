@@ -309,15 +309,27 @@ class GpuRelease(unittest.TestCase):
         seen = [{4242, 7}, {4242, 7}, {7}]
         with mock.patch.object(T, "gpu_pids", side_effect=lambda: seen.pop(0) if len(seen) > 1 else seen[0]), \
                 mock.patch.object(SV.time, "sleep") as sleep:
-            SV.wait_gpu_release(4242, timeout=30)
+            released = SV.wait_gpu_release(4242, timeout=30)
+        self.assertIs(released, True)                           # (a RAM restart goes on only on True)
         self.assertEqual(seen, [{7}])
         self.assertEqual(sleep.call_count, 2)
+
+    def test_reports_false_when_the_gpu_keeps_listing_the_engine(self):
+        from unittest import mock
+        from serve import server as SV, telemetry as T
+        ticks = iter(range(0, 1000))                            # (a fake clock: one second per reading)
+        fake_time = mock.Mock(time=lambda: float(next(ticks)), sleep=mock.Mock())
+        with mock.patch.object(T, "gpu_pids", return_value={4242, 7}), mock.patch.object(SV, "time", fake_time):
+            released = SV.wait_gpu_release(4242, timeout=3)
+        self.assertIs(released, False)                          # (the RAM-restart loop stops retrying on this)
+        self.assertTrue(fake_time.sleep.called)
 
     def test_without_nvml_a_short_wait(self):
         from unittest import mock
         from serve import server as SV, telemetry as T
         with mock.patch.object(T, "gpu_pids", return_value=None), mock.patch.object(SV.time, "sleep") as sleep:
-            SV.wait_gpu_release(4242)
+            released = SV.wait_gpu_release(4242)
+        self.assertIs(released, True)
         sleep.assert_called_once()
 
 
