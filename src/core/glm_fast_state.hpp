@@ -15,6 +15,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -533,6 +534,7 @@ struct Glm5Model::FastState {
     // (a promotion only adds), so it is set there (check_resident) and holds until the next one.
     // STRATA_GLM_RESIDENT_SKIP=0 launches them anyway (A/B); on by default on AMD only (glmfast::on_by_default_on_amd).
     bool all_resident = false;
+    bool all_in_vram = false;   // every expert in VRAM as of the last boundary, whatever STRATA_GLM_RESIDENT_SKIP says
     // STRATA_GLM_SKIP_EMPTY=1: the same per layer for the batched rows (glm_rows.cu; the token path keeps the rule
     // above, its layers' launches are in its graphs' key) - layer_res[il]: every expert of layer il in VRAM as of the
     // last boundary, so its routes leave out the wait, the fetch and the CPU lane's wait.  Off: empty.
@@ -550,7 +552,7 @@ struct Glm5Model::FastState {
                 layer_res[(size_t) il] = all ? 1 : 0;
             }
         }
-        bool all = on;
+        bool all = true;
         for (int il = l0; il < lt && all; ++il) {
             if (!L[(size_t) il].moe) continue;
             const int* so = slot_of.data() + (size_t) il * n_expert;
@@ -560,7 +562,8 @@ struct Glm5Model::FastState {
                     break;
                 }
         }
-        all_resident = all;
+        all_in_vram = all;
+        all_resident = on && all;
     }
     std::vector<uint32_t> cnt;   // il * n_expert + e -> LFU count (aged), over both tiers
     // ... and the long memory: routes per key across sessions (expert_usage.txt), halved when one passes 2^30 -
@@ -586,9 +589,21 @@ struct Glm5Model::FastState {
                   kRHelper = 7 };   // helper-owned UMA weights: readable by prefill, never a RAM-tier victim
     struct RamClass {
         size_t stride = 0;
-        uint8_t* base = nullptr;
+        uint8_t* base = nullptr;   // the first piece (the only one unless per_part > 0)
         int n = 0;
         bool registered = false;   // numa_pinned's (mmap + cudaHostRegister), not cudaHostAlloc's
+        // pinned in pieces of per_part slots (Windows: a big block takes far more of the per-process pinning budget
+        // than its size - a 2-GPU split's second part got 0 GB, #417); 0: one block from base
+        int per_part = 0;
+        std::vector<uint8_t*> parts;
+        uint8_t* slot(size_t s) const {
+            return per_part > 0 ? parts[s / (size_t) per_part] + (s % (size_t) per_part) * stride : base + s * stride;
+        }
+        size_t part_slots(size_t i) const {   // the slots of piece i
+            return per_part > 0 ? std::min((size_t) per_part, (size_t) n - i * (size_t) per_part) : (size_t) n;
+        }
+        size_t n_parts() const { return per_part > 0 ? parts.size() : (base != nullptr ? 1 : 0); }
+        uint8_t* part(size_t i) const { return per_part > 0 ? parts[i] : base; }
         std::vector<int> key;   // slot -> il * n_expert + e, -1 none
         std::vector<uint64_t> tick;   // the route clock when a route last used it (or it arrived): eviction's recency
         std::vector<char> st;   // kRFree / kRHold / kRRelease (promoted: free at the boundary) /
@@ -599,9 +614,10 @@ struct Glm5Model::FastState {
     std::vector<int> layer_rc;   // layer -> RAM class
     std::vector<int> ram_of;     // key -> slot in its class, -1
     // STRATA_GLM_TIER_DIAG=1 (debug): how each expert last left the tiers (0 never held, 1 dropped from VRAM, 2 evicted
-    // from RAM, 3 dropped by the prompt path's lending), and the disk reads by that cause
+    // from RAM, 3 dropped by the prompt path's lending, 4 evicted from RAM by the lending's park), and the disk reads by
+    // that cause
     std::vector<uint8_t> left;
-    uint64_t diag_disk[4] = {0, 0, 0, 0}, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_lend_park = 0, diag_b = 0;
+    uint64_t diag_disk[8] = {}, diag_lend_evict = 0, diag_drop = 0, diag_ram_evict = 0, diag_lend = 0, diag_lend_park = 0, diag_b = 0;
     uint64_t diag_resident_skip = 0;   // RAM-resident mode: spare refills skipped (no free RAM slot, no drop)
     uint64_t diag_dup = 0, diag_adopt = 0;   // the boundary's clean-up: duplicate RAM copies freed, lost ones adopted
     size_t ram_bytes = 0;
@@ -639,6 +655,9 @@ struct Glm5Model::FastState {
     uint8_t* rows_scratch = nullptr;
     unsigned long long* rows_scr = nullptr;
     int rows_group = 0;                        // a group's rows at most (0: grouping off)
+    // STRATA_GLM_MULTI_MTP: rows_scr's rows (a group of verify windows); rows rows_group .. rows_scr_rows - 1 have no
+    // scratch slots of their own (they name earlier rows'), so they group only while every expert is in VRAM
+    int rows_scr_rows = 0;
     std::vector<uint8_t*> stage;   // pinned: disk reads when no RAM slot is free
     size_t stage_bytes = 0;        // ... each (an expert's blob); the start's uploads go through stage[0] too
     int warm_cuda_err = 0;         // the CUDA error that stopped the last fast_warm (0: none, or not a CUDA call)

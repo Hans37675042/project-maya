@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 import threading
 import unittest
@@ -60,6 +61,18 @@ class Rendering(unittest.TestCase):
         result = self.template.render(msgs, tools=schemas, **kwargs)
         self.assertEqual(request, original, "rendering must not mutate the client's history")
         return result
+
+    def render_with_setting(self, setting, messages, **options):
+        """A render with MAYA_DS4_KEEP_THINKING as a shell or the config's env sets it (`None`: unset)."""
+        saved = os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+        try:
+            if setting is not None:
+                os.environ["STRATA_DS4_KEEP_THINKING"] = setting
+            return self.render(messages, **options)
+        finally:
+            os.environ.pop("STRATA_DS4_KEEP_THINKING", None)
+            if saved is not None:
+                os.environ["STRATA_DS4_KEEP_THINKING"] = saved
 
     def test_official_golden_fixtures_byte_for_byte(self):
         for number in range(1, 6):
@@ -193,6 +206,23 @@ class Rendering(unittest.TestCase):
         self.assertNotIn("Obsolete reasoning", rendered)
         self.assertIn("Old answer", rendered)
 
+    def test_keep_thinking_setting_leaves_old_reasoning_in_the_prompt(self):
+        rendered = self.render_with_setting("1", BASE + [{"role": "assistant", "reasoning_content": "Kept reasoning",
+                                                          "content": "Old answer"},
+                                                         {"role": "user", "content": "Next"}])
+        self.assertIn("Kept reasoning", rendered)
+        self.assertIn("Old answer", rendered)
+
+    def test_keep_thinking_setting_lets_a_tool_less_turn_continue_the_last_prompt(self):
+        # (the state a slot keeps is the prompt that was read, so the next turn must start with it - not the case
+        #  while the earlier turn's reasoning is dropped: DeepSeek's own serving, the default)
+        first = [{"role": "user", "content": "Question"}]
+        second = first + [{"role": "assistant", "reasoning_content": "Because.", "content": "Answer"},
+                          {"role": "user", "content": "Next one"}]
+        self.assertTrue(self.render_with_setting("1", second).startswith(self.render_with_setting("1", first)))
+        self.assertFalse(self.render_with_setting(None, second).startswith(self.render_with_setting(None, first)))
+        self.assertFalse(self.render_with_setting("0", second).startswith(self.render_with_setting("0", first)))
+
     def test_namespaced_schema_and_call_are_qualified_once(self):
         schema = copy.deepcopy(TOOL)
         schema["namespace"] = {"name": "search", "description": "Search namespace"}
@@ -301,6 +331,31 @@ class Parsing(unittest.TestCase):
                         text = ("reason</think>" if thinking else "") + "\n\nanswer"
                         events = parse(text, thinking=thinking, stream=stream, step=step)
                         self.assertEqual("".join(e.text for e in events if e.kind == "content"), "\n\nanswer")
+
+    def test_long_string_argument_streams_before_its_closing_tag(self):
+        # issue #403: a file's content (string="true") goes out as the model writes it, not at its closing tag;
+        # the pieces join to the same JSON as the whole call, a string="false" value still arrives whole
+        content = 'line "one" <tag> \\ é\n' * 40 + '<｜DSML｜ invoke name="x">'
+        params = ('<｜DSML｜ parameter name="path" string="true">a.txt</｜DSML｜ parameter>\n'
+                  '<｜DSML｜ parameter name="content" string="true">' + content + '</｜DSML｜ parameter>\n'
+                  '<｜DSML｜ parameter name="mode" string="false">{"append": false}</｜DSML｜ parameter>')
+        text = dsml(params, "write")
+        for step in (1, 3, 17, len(text)):
+            with self.subTest(step=step):
+                parser = OutputParser(thinking=False, stream_tools=True, dsml=True)
+                events, args_before_close = [], 0
+                close = text.index("</｜DSML｜ parameter>", text.index('name="content"'))
+                for i in range(0, len(text), step):
+                    events.extend(parser.feed(text[i:i + step]))
+                    if i + step <= close:
+                        args_before_close = sum(len(e.text) for e in events if e.kind == "tool_args")
+                events += parser.finish()
+                call = next(e.call for e in events if e.kind == "tool_call")
+                self.assertEqual(call.arguments, {"path": "a.txt", "content": content, "mode": {"append": False}})
+                streamed = "".join(e.text for e in events if e.kind == "tool_args")
+                self.assertEqual(json.loads(streamed), call.arguments)
+                if step < len(text):
+                    self.assertGreater(args_before_close, len(content) // 2)
 
     def test_namespace_keeps_qualified_internal_name(self):
         text = dsml('<｜DSML｜ parameter name="q" string="true">123</｜DSML｜ parameter>', "search::lookup")

@@ -18,7 +18,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from serve.frontend import ChatTemplate  # noqa: E402
-from serve.server import CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, Service, StrataEngine, serve  # noqa: E402
+from serve.server import (CONTEXT_MIN, MAYA_VERSION, ByteTokenizer, MockEngine, Service, StrataEngine, serve,  # noqa: E402
+                          trained_context_ds4)
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -73,6 +74,29 @@ class Dashboard(unittest.TestCase):
         j = json.loads(b)
         self.assertEqual((s, j["context"], j["min"]), (200, 32768, CONTEXT_MIN))
         self.assertGreaterEqual(j["max"], 32768)
+        self.assertEqual(j["tested"], 262144)                   # (the GLM engine's: the dashboard warns past it)
+
+    def test_deepseek_context_range(self):
+        """A DeepSeek pack: the context its ds4.txt says the model was trained for is the top (V4.1-Flash: 1M), and its
+        engine is tested up to it."""
+        pack = Path(self.tmp.name) / "maya-ds4"
+        pack.mkdir()
+        (pack / "ds4.txt").write_text("hidden_size 4096\nmax_position_embeddings 1048576\nsliding_window 128\n")
+        self.assertEqual(trained_context_ds4(pack), 1048576)
+        self.assertIsNone(trained_context_ds4(Path(self.tmp.name) / "nowhere"))
+        (Path(self.tmp.name) / "bad").mkdir()
+        (Path(self.tmp.name) / "bad" / "ds4.txt").write_text("max_position_embeddings many\n")
+        self.assertIsNone(trained_context_ds4(Path(self.tmp.name) / "bad"))
+        self.svc.trained_context = trained_context_ds4(pack)
+        self.engine.info = dict(self.engine.info, engine_kind="ds4")
+        s, _, b = self.req("GET", "/api/context")
+        j = json.loads(b)
+        self.assertEqual((j["max"], j["tested"]), (1048576, 1048576))
+        s, _, _ = self.req("POST", "/api/context", {"max_context": 1048576})
+        self.assertEqual(s, 202)
+        self.assertEqual((self.wait_reload()["context"]), 1048576)
+        s, _, _ = self.req("POST", "/api/context", {"max_context": 2097152})   # (past what it was trained for)
+        self.assertEqual(s, 400)
 
     def test_reload_changes_the_context_and_saves_it(self):
         s, _, b = self.req("POST", "/api/context", {"max_context": 65536})
@@ -272,10 +296,60 @@ class GpuMap(unittest.TestCase):
         self.assertEqual((g["parts"]["pool"], g["parts"]["vision"]), (r["pool"] - r["tail"], enc))
         self.assertEqual(g["parts"]["other"], 0)
 
+    def test_a_vision_tower_in_the_engines_process(self):
+        # (strata-ds4: the tower on the first GPU inside the engine - vision_own, not a pool tail lent to another process)
+        r = dict(self.r, vision_own=318 * 2**20)
+        engine = sum(r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own = engine + r["vision_own"] + 400 * 2**20
+        (g,) = self.gm.view([r], [self.card(own, {100: own})], engine_pid=100)
+        self.assertEqual((g["parts"]["vision"], g["vision_own"]), (r["vision_own"], r["vision_own"]))
+        self.assertEqual((g["parts"]["rest"], g["parts"]["other"]), (400 * 2**20, 0))   # the CUDA context, not vision
+        (s,) = self.gm.view([r], [], engine_pid=100)             # (no NVML: the start's measurement)
+        self.assertEqual(s["parts"]["vision"], r["vision_own"])
+        self.assertEqual(sum(s["parts"].values()) + s["free"], s["total"])
+
+    def test_an_engine_run_through_a_launcher(self):
+        # (the engine's command a script that runs `nsys launch` (pid 63), which starts the engine (85) as a grandchild:
+        # NVML lists 85 - found among the launcher's tree; the launcher's pid alone found nothing, and the engine's own
+        # growth since the start's measurement was drawn as other programs)
+        engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        own, reserve, other = engine + 500 * 2**20, 128 * 2**20, 600 * 2**20
+        tree = {63, 84, 85}
+        (g,) = self.gm.view([self.r], [self.card(own + reserve, {85: own})], engine_pid=tree)
+        self.assertEqual((g["measured"], g["parts"]["other"], g["parts"]["rest"]), ("nvml", 0, 500 * 2**20 + reserve))
+        (g,) = self.gm.view([self.r], [self.card(own + reserve + other, {85: own, 200: other})], engine_pid=tree)
+        self.assertEqual((g["parts"]["other"], g["parts"]["rest"]), (other, 500 * 2**20 + reserve))   # a real one
+        r = dict(self.r, vision=self.r["tail"])                  # (the on-demand encoder, run through one too)
+        enc = r["tail"] - 50 * 2**20
+        own = engine - r["tail"] + 400 * 2**20
+        (g,) = self.gm.view([r], [self.card(own + enc, {85: own, 301: enc})], tree, vision_pid={300, 301},
+                            vision_lent=True)
+        self.assertEqual((g["parts"]["vision"], g["parts"]["other"], g["parts"]["rest"]), (enc, 0, 400 * 2**20))
+
+    def test_the_engine_not_listed_the_start_measurement(self):
+        # (NVML lists the engine under a pid the server can't name - a pid namespace it does not share: the card is
+        # drawn from the start's measurement, as without NVML)
+        engine = sum(self.r[k] for k in ("weights", "kv", "act", "drafter", "window", "pool"))
+        (g,) = self.gm.view([self.r], [self.card(engine + GB, {450462: engine + GB})], engine_pid=65)
+        start = self.r["total"] - self.r["free"]
+        self.assertEqual((g["measured"], g["parts"]["rest"]), ("start", start - engine))
+
     def test_never_more_than_the_card(self):
         (g,) = self.gm.view([self.r], [self.card(26 * GB, {100: 25 * GB, 200: 2 * GB})], engine_pid=100)
         self.assertLessEqual(sum(g["parts"].values()), g["total"])
         self.assertEqual(g["free"], 0)
+
+    def test_strata_ds4s_prompt_buffers_and_tensor_parallel(self):
+        # (strata-ds4 at --tp 8: a 5060 Ti of the group of 8 - its prompt chunks' buffers and tensor parallel's copies
+        # told apart, the GLM engine's lines without them)
+        r = self.gm.parse("VRAM dev=3 pci=0000:05:00.0 total=16610951168 free=301989888 weights=268435456 kv=33554432 "
+                          "kv_ram=0 act=134217728 drafter=0 window=0 pool=13421772800 tail=0 borrow=0 vision=0 "
+                          "vision_own=0 prompt=1610612736 tp=805306368 tp_n=8 slots=3343 ctx=262144 layers=3-39")
+        (g,) = self.gm.view([r], [], engine_pid=100)
+        self.assertEqual((g["parts"]["prompt"], g["parts"]["tp"], g["tp_n"]), (1610612736, 805306368, 8))
+        self.assertEqual(sum(g["parts"].values()) + g["free"], g["total"])
+        (h,) = self.gm.view([self.r], [], engine_pid=100)
+        self.assertEqual((h["parts"]["prompt"], h["parts"]["tp"], h["tp_n"]), (0, 0, 0))
 
     def test_two_parts_on_one_card_add_up(self):
         a = dict(self.r, layers=[0, 20], slots=500)
@@ -331,6 +405,42 @@ class GpuRelease(unittest.TestCase):
             released = SV.wait_gpu_release(4242)
         self.assertIs(released, True)
         sleep.assert_called_once()
+
+
+class NvmlPids(unittest.TestCase):
+    """The GPU map finds an engine run through a launcher: NVML lists a process the launcher started, not it."""
+
+    def test_its_own_pid_when_listed_or_nothing_is(self):
+        from unittest import mock
+        from serve import server as SV
+        with mock.patch.dict(sys.modules, {"psutil": None}):     # (nothing is looked up then)
+            self.assertEqual(SV.nvml_pids(85, {85, 200}), {85})
+            self.assertEqual(SV.nvml_pids(63, set()), {63})
+            self.assertEqual(SV.nvml_pids(None, {85}), set())
+            self.assertEqual(SV.nvml_pids(63, {85}), {63})        # (no psutil: the pid alone)
+
+    def test_the_processes_a_launcher_started(self):
+        try:
+            import psutil
+        except ImportError:
+            self.skipTest("psutil is not installed")
+        import subprocess
+        from serve import server as SV
+        # (a launcher that does not exec: python starting python, which sleeps)
+        launcher = subprocess.Popen([sys.executable, "-c", "import subprocess, sys; subprocess.run([sys.executable, "
+                                     "'-c', 'import sys, time; print(flush=True); time.sleep(60)'])"],
+                                    stdout=subprocess.PIPE, text=True)
+        try:
+            launcher.stdout.readline()                           # (the grandchild runs)
+            pids = SV.nvml_pids(launcher.pid, {1 << 30})
+            self.assertIn(launcher.pid, pids)
+            self.assertGreater(len(pids), 1)                     # (and the grandchild: a venv's on Windows, more)
+        finally:
+            for p in psutil.Process(launcher.pid).children(recursive=True):
+                p.kill()
+            launcher.kill()
+            launcher.wait()
+            launcher.stdout.close()
 
 
 if __name__ == "__main__":

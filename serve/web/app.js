@@ -231,10 +231,31 @@ async function loadHealth() {
     setTimeout(loadHealth, 2000);
   }
 }
+// the model family's logo beside its name in the sidebar (web/logo-*.svg: lobe-icons' marks, MIT); none for another
+// (GLM: Z.ai's one-colour mark - black, inverted on the dark theme: side__logo--mono)
+const MODEL_LOGOS = [[/glm/i, "glm", true], [/deepseek/i, "deepseek"], [/minimax/i, "minimax"], [/qwen/i, "qwen"]];
+function modelLogo(name) {
+  const m = MODEL_LOGOS.find(([re]) => re.test(name || ""));
+  return m ? `<span class="side__logo${m[2] ? " side__logo--mono" : ""}"><img src="web/logo-${m[1]}.svg" alt="" ` +
+             `width="20" height="20"></span>` : "";
+}
+// a model id as people write the model's name, for the sidebar: "glm-5.3-flash" -> "GLM 5.3 Flash",
+// "deepseek-v4.1-flash" -> "DeepSeek V4.1 Flash", "qwen3.8-flash-next" -> "Qwen3.8 Flash Next" (the id itself on hover)
+const NAME_WORDS = {glm: "GLM", deepseek: "DeepSeek", minimax: "MiniMax", qwen: "Qwen"};
+function modelDisplayName(id) {
+  return String(id || "").split(/[-_\s]+/).filter(Boolean).map((w) => {
+    const lw = w.toLowerCase(), m = lw.match(/^([a-z]+)(\d.*)$/);
+    if (NAME_WORDS[lw]) return NAME_WORDS[lw];
+    if (m && NAME_WORDS[m[1]]) return NAME_WORDS[m[1]] + m[2];   // (a brand with its version: qwen3.8)
+    if (/^[a-z]\d/.test(lw)) return lw.toUpperCase();             // (a version: v4.1, m3.1)
+    return lw.charAt(0).toUpperCase() + lw.slice(1);
+  }).join(" ");
+}
 function renderModelLine() {
   const ctx = health.max_context ? `${ctxfmt(health.max_context)} context` : "";
   const ver = health.version ? `v${health.version}` : "";
-  $("side-model").innerHTML = `<b>${esc(health.model)}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}`;
+  $("side-model").innerHTML = `${modelLogo(health.model)}<span class="side__model-text" title="${esc(health.model)}">` +
+                              `<b>${esc(modelDisplayName(health.model))}</b>${esc([ctx, ver].filter(Boolean).join(" · "))}</span>`;
   $("chat-empty-model").textContent = [health.model, ctx, ver ? `Project Maya ${ver}` : ""].filter(Boolean).join(" · ");
 }
 
@@ -272,11 +293,10 @@ const TIER_SETS = {
     {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
   ],
-  ds4: [
-    {key: "cpu", label: "On the CPU", icon: "cpu", unit: "/tok", digits: 1, tone: "info",
+  ds4: [   // (GLM's three - the CPU lane computes the experts that are not in VRAM - and the n-gram memory)
+    {key: "ram_fetch", label: "From RAM", icon: "link", unit: "/tok", digits: 2, tone: "info",
      sub: "experts the CPU computed from RAM"},
-    {key: "disk_mb", label: "Disk reads", icon: "disk", unit: " MB/tok", digits: 1, tone: "warn",
-     sub: "read from the SSD a token"},
+    {key: "disk", label: "From SSD", icon: "disk", unit: "/tok", digits: 2, tone: "warn", sub: "experts read from the SSD"},
     {key: "promo", label: "Promoted", icon: "bolt", unit: "/tok", digits: 2, sub: "experts moved into VRAM"},
     {key: "engram_ms", label: "N-gram memory", icon: "layers", unit: " ms/tok", digits: 2, sub: "n-gram lookups"},
   ],
@@ -312,30 +332,21 @@ function renderTiers(t, eng) {
     $(`tv-${m.key}`).innerHTML = shown == null ? "–" : `${esc(shown)}<small>${esc(m.unit)}</small>`;
     let sub = m.sub;
     if (m.key === "engram_ms" && eng && eng.engram_lookups) sub = `${fmt(+eng.engram_lookups)} n-gram lookups a token`;
-    if (m.key === "disk_mb" && v == null) sub = "not measured on this system";
-    if (m.key === "cpu" && n.ram != null) sub = `${fmt(n.ram, 1)} of them from RAM, the rest from the SSD`;
+    if ((m.key === "disk" || m.key === "ram_fetch") && v == null && ds4) sub = "not measured on this system";
     $(`ts-${m.key}`).textContent = (stale ? "last answer: " : "") + sub;
     spark(`tp-${m.key}`, (h[m.key] || []).map((x) => (x == null ? 0 : x)), m.max);
   }
-  let vu, ru, disk, total;
-  const ds4Tier = ds4 && (+eng.ram_experts || 0) > 0;
-  if (ds4) {   // DeepSeek: the VRAM slots, the RAM tier's (when on), and the rest read in place from the model's files
-    vu = +eng.expert_slots || 0;
-    ru = ds4Tier ? +eng.ram_experts : +eng.cpu_experts || 0;
-    disk = ds4Tier ? Math.max(0, (+eng.cpu_experts || 0) - ru) : 0;
-    total = Math.max(1, vu + ru + disk);
-  } else {
-    vu = n.vram_used || 0; ru = n.ram_used || 0;
-    total = (eng && eng.experts) || Math.max(1, vu + ru);
-    disk = Math.max(0, total - vu - ru);
-  }
+  // VRAM, RAM and the rest on the SSD - DeepSeek's (maya-ds4) the same keys: its RAM the copies or the read-ahead
+  const vu = n.vram_used || 0, ru = n.ram_used || 0;
+  const total = (ds4 ? vu + (n.cpu_n != null ? n.cpu_n : +eng.cpu_experts || 0) : eng && eng.experts) || Math.max(1, vu + ru);
+  const disk = Math.max(0, total - vu - ru);
   $("tierbar-vram").style.width = `${(100 * vu) / total}%`;
   $("tierbar-ram").style.width = `${(100 * ru) / total}%`;
   $("tierbar-disk").style.width = `${(100 * disk) / total}%`;
-  $("tier-ram-label").textContent = ds4 && !ds4Tier ? "RAM cache / SSD (in place)" : "Pinned RAM";
-  $("tier-disk-item").hidden = ds4 && !ds4Tier;
-  $("tier-vram-text").textContent = ds4 ? `${fmt(vu)} experts` : `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
-  $("tier-ram-text").textContent = ds4 ? `${fmt(ru)} experts` : `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
+  $("tier-ram-label").textContent = ds4 ? "RAM" : "Pinned RAM";
+  $("tier-disk-item").hidden = false;
+  $("tier-vram-text").textContent = `${fmt(vu)} experts · ${fmt(n.vram_gb, 1)} GB`;
+  $("tier-ram-text").textContent = `${fmt(ru)} experts · ${fmt(n.ram_gb, 1)} GB`;
   $("tier-disk-text").textContent = `${fmt(disk)} experts`;
   $("tiers-sub").textContent = age == null ? "" : stale ? `last reading ${ago(age)} ago, from the last answer`
                                                         : `live · ${fmt(total)} routed experts`;
@@ -362,6 +373,7 @@ function renderTiers(t, eng) {
 // one GPU: its row, opened (the hardware cards have its readings)
 const GPU_PARTS = [
   {key: "weights", label: "Model weights"}, {key: "kv", label: "KV cache"}, {key: "act", label: "Activations"},
+  {key: "prompt", label: "Prompt buffers"}, {key: "tp", label: "Tensor parallel"},
   {key: "drafter", label: "Drafter"}, {key: "pool", label: "Expert pool"}, {key: "vision", label: "Vision encoder"},
   {key: "rest", label: "CUDA and the rest"}, {key: "other", label: "Other programs"},
 ];
@@ -407,11 +419,15 @@ function gpuDetail(g, segs, m) {
                          : `${ctxfmt(ctx)} positions`) + (inUse ? ` · ${kfmt(inUse)} in use` : "") +
         (g.kv_ram ? ` · ${gb(g.kv_ram)} GB pinned in RAM` : ""),
     act: "one token's working buffers",
+    prompt: "a long prompt's chunks: their working buffers and the ring the CPU lane's experts stream through",
+    tp: g.tp_n > 1 ? `the copies a group of ${g.tp_n} GPUs needs: the tensors each of them holds whole, and its layers' KV cache`
+                   : "",
     drafter: [g.drafter ? `weights ${gb(g.drafter, 2)} GB` : "", g.window ? `verify window ${gb(g.window, 2)} GB` : ""]
       .filter(Boolean).join(" · "),
     pool: [g.slots ? `${fmt(g.slots)} expert slots` : "", g.borrow ? `prompts borrow up to ${gb(g.borrow)} GB of it` : ""]
       .filter(Boolean).join(" · "),
-    vision: g.vision_lent ? "the pool's tail, while it encodes" : "its own process",
+    vision: g.vision_lent ? "the pool's tail, while it encodes" : g.vision_own ? "the vision tower, in the engine's process"
+                                                                                : "its own process",
     rest: "the driver's reserve and context, conversation snapshots and small buffers",
     other: "processes that are not Maya's",
     free: (g.free || 0) < 1.5 * GIB ? "kept free for the driver and the sampler" : "unused",
@@ -830,8 +846,13 @@ $("report-show").onclick = async () => {
 };
 
 function facts(el, rows) {
-  el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
+  const html = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
     `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="Copy">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
+  // (rebuilt only when it changes: About renders on every poll, and new copy buttons each second made their icons
+  //  flash and cut a copy's check mark short)
+  if (el._facts === html) return;
+  el._facts = html;
+  el.innerHTML = html;
 }
 // "Tesla V100 + Tesla V100" (the server's list) -> "2 × Tesla V100"; mixed cards stay listed
 function gpuNames(name, count) {
@@ -1547,6 +1568,34 @@ function onTool(m, x) {
                       state: x.skipped ? "skipped" : x.ok ? "done" : "error"});
   }
 }
+// an answer's new HTML into its bubble with the fewest DOM changes (it repaints up to every frame while it streams):
+// a block that is the same stays as it is - no flash, a selection and a code block's wrap kept - and the code block
+// still being written keeps its frame, buttons and scroll box, its code alone replaced
+function patchHtml(el, html) {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const next = [...tpl.content.childNodes], cur = [...el.childNodes];
+  next.forEach((b, i) => {
+    const a = cur[i];
+    if (!a) el.appendChild(b);
+    else if (a.nodeType === 3 && b.nodeType === 3) { if (a.data !== b.data) a.data = b.data; }
+    else if (a.nodeType === 1 && b.nodeType === 1 && a.isEqualNode(b)) { /* the same */ }
+    else if (a.nodeType === 1 && b.nodeType === 1 && a.matches(".st-code") && b.matches(".st-code") &&
+             a.dataset.lang === b.dataset.lang) patchCode(a, b);
+    else el.replaceChild(b, a);
+  });
+  for (let i = cur.length - 1; i >= next.length; i--) cur[i].remove();
+}
+// a code block that grew: the new code into the block, which stays scrolled to its end while it is written (unless its
+// reader scrolled it up); the buttons swapped only when their set changes (Preview, once the block is complete)
+function patchCode(a, b) {
+  const pre = a.querySelector("pre"), code = a.querySelector("code"), nc = b.querySelector("code");
+  const atEnd = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 24;
+  if (code.innerHTML !== nc.innerHTML) code.innerHTML = nc.innerHTML;
+  if (atEnd) pre.scrollTop = pre.scrollHeight;
+  const ah = a.querySelector(".st-code__actions"), bh = b.querySelector(".st-code__actions");
+  if (ah && bh && ah.children.length !== bh.children.length) ah.replaceWith(bh);
+}
 function updateAssistant(el, m, streaming) {
   const det = el.querySelector("details.think");
   if (m.reasoning) {
@@ -1568,7 +1617,7 @@ function updateAssistant(el, m, streaming) {
   } else if (!m.text && streaming && !(m.tools && m.tools.length)) {
     bubble.innerHTML = m.reasoning ? `<span class="muted cursor">Writing</span>` : `<span class="cursor"></span>`;
   } else {
-    bubble.innerHTML = answerHtml(m, streaming);
+    patchHtml(bubble, answerHtml(m, streaming));
     if (streaming) bubble.classList.add("cursor"); else bubble.classList.remove("cursor");
   }
   el.querySelector(".meta-text").textContent = m.meta || (streaming ? "" : m.stopped ? "Stopped" : "");
@@ -1585,9 +1634,23 @@ function renderChat() {
   updateCtxMeter();
 }
 function nearBottom() { const s = $("chat-scroll"); return s.scrollHeight - s.scrollTop - s.clientHeight < 120; }
-function scrollDown(force) { const s = $("chat-scroll"); if (force || nearBottom()) s.scrollTop = s.scrollHeight; updateJump(); }
+// the chat follows a streaming answer down until its reader scrolls up - by any amount: a wheel notch (~100 px) stayed
+// within nearBottom, and the next repaint pulled it back down - and again once they are back at the bottom
+let follow = true, lastTop = 0;
+function scrollDown(force) {
+  const s = $("chat-scroll");
+  if (force) follow = true;
+  if (follow) { s.scrollTop = s.scrollHeight; lastTop = s.scrollTop; }
+  updateJump();
+}
 function updateJump() { $("jump-latest").hidden = nearBottom() || !messages.length; }
-$("chat-scroll").addEventListener("scroll", updateJump, {passive: true});
+$("chat-scroll").addEventListener("scroll", () => {
+  const s = $("chat-scroll");
+  if (s.scrollTop < lastTop - 2) follow = false;
+  if (s.scrollHeight - s.scrollTop - s.clientHeight < 32) follow = true;   // (a shrink clamps it to the bottom too)
+  lastTop = s.scrollTop;
+  updateJump();
+}, {passive: true});
 $("jump-latest").onclick = () => scrollDown(true);
 
 $("chat").addEventListener("click", (e) => {
@@ -2132,7 +2195,8 @@ function outputsCtx() {
   }
   $("ctx-est").textContent = text;
   const warns = [];
-  if (v > 262144) warns.push("Beyond 256K is untested on this engine.");
+  const tested = ctxInfo.tested || 262144;   // (the largest context run end to end on this engine)
+  if (v > tested) warns.push(`Beyond ${ctxfmt(tested)} is untested on this engine.`);
   if (e && e.vram && e.gb > e.vram * 0.6) warns.push("That leaves little GPU memory for experts: answers get much slower, and it may not start (the current size then comes back).");
   if (v !== now) warns.push("Saving reloads the model (1-3 minutes).");
   $("ctx-warn").hidden = !warns.length;

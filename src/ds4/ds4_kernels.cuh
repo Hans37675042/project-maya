@@ -11,6 +11,10 @@
 #include <cstdint>
 #include <cuda_runtime.h>
 
+#include "strata/kernels/sampler.hpp"
+
+#include <vector>
+
 namespace strata::ds4 {
 
 constexpr int kWin = 16;      // tokens a window takes at most (the EXL3 GEMV's activations per job)
@@ -40,8 +44,9 @@ void embed(const uint16_t* rows_bf16, int T, float* h, int dim, int hc, cudaStre
 ///         pos_v = pos + (v / vpp) * pos_step
 ///   quant 0 none, 1 FP8 E4M3 with a power-of-two scale per 32, 2 FP4 E2M1 with an E4M3 scale per 16, 3 FP4 with a
 ///         power-of-two scale per 32 (the reference kernels' act_quant / fp4_act_quant, inplace)
-/// and written back to x, or as BF16 to dst + v * dst_stride when dst is given, or packed (quant > 0: the cache format of
-/// that number, kv_row_bytes) to pdst + v * pdst_stride bytes when pdst is given (x then left as it was).
+/// and written back to x, or as BF16 (dst_f16: FP16, __float2half_rn - rows_f16's rounding) to dst + v * dst_stride when
+/// dst is given, or packed (quant > 0: the cache format of that number, kv_row_bytes) to pdst + v * pdst_stride bytes
+/// when pdst is given (x then left as it was).
 struct Finish {
     const float* w = nullptr;
     float eps = 1e-20f;
@@ -50,9 +55,12 @@ struct Finish {
     int quant = 0;
     uint16_t* dst = nullptr;
     long long dst_stride = 0;
+    int dst_f16 = 0;
     uint8_t* pdst = nullptr;
     long long pdst_stride = 0;
 };
+/// a packed FP4 row's bytes (Finish::pdst): len / 2 of codes, a scale byte a group (quant 2: 16 values, quant 3: 32)
+constexpr size_t fp4_row_bytes(int len, int quant) { return (size_t) len / 2 + (size_t) len / (quant == 2 ? 16 : 32); }
 void finish(float* x, int n_vec, int len, long long stride, const Finish& f, cudaStream_t s);
 
 /// Hyper-Connections, row t of each [T][..] array: mixes[t][m] = (h_flat . fn[m]) * rsqrt(mean(h_flat^2) + eps), then
@@ -121,13 +129,28 @@ struct Rows {
 /// with candidates p = cand[t][i / blk] * blk + i % blk for i < lim.k[t] * blk; positions >= lim.n[t] (or past the
 /// query's candidates) -> -inf.  q rows heads * hd apart, w rows 64, cand rows cand_stride, out rows out_stride; the keys
 /// k rows of format kfmt (the cache's kKvFp4p, or kKvBf16).
+/// With kKvFp4p keys and DS4_INDEX_TC=1 (and tc) the tensor cores' kernel: the same products, FP32 sums in another
+/// order.
 void index_score(const float* q, const float* w, const void* k, int heads, int hd, int T, int n, const int* cand,
                  int cand_stride, int blk, const Rows& lim, float* out, long long out_stride, cudaStream_t s,
-                 int kfmt = kKvFp4p);
-/// The top r.k[t] of vals[t][0, r.n[t]) (row t at vals + t * stride): their positions (unordered; with candidates
-/// cand[t][i / blk] * blk + i % blk) into out[t][0, k).  r.k[t] >= r.n[t] takes them all.
+                 int kfmt = kKvFp4p, bool tc = true);
+/// The top r.k[t] of vals[t][0, r.n[t]) (row t at vals + t * stride): their positions (with candidates
+/// cand[t][i / blk] * blk + i % blk) into out[t][0, k) - those above the k-th value, then of the values equal to it the
+/// first, each run in position order (the same every run).  r.k[t] >= r.n[t] takes them all.
+/// sc (a decode window's rows, T <= sc->T): rows of kTopkSegMin positions or more in segments of ~kTopkSeg, a block
+/// each (their own top k, at most sc->K) and then a block a row over the picks above the segments' largest k-th - the
+/// same picks in the same order, a long row's passes over P blocks instead of one (3 rows: 164 -> 78 us at 64K
+/// positions, 316 -> 88 us at 128K on an RTX 5060 Ti)
+struct TopkScratch {
+    float* val = nullptr;   // [T][P][K]
+    int* idx = nullptr;     // [T][P][K]
+    int* cnt = nullptr;     // [T][P]
+    uint32_t* kth = nullptr;   // [T][P]: each segment's k-th (ordered key)
+    int T = 0, P = 0, K = 0;
+};
+constexpr int kTopkSeg = 16384, kTopkSegMin = 32768, kTopkSegMax = 64;
 void topk(const float* vals, long long stride, int T, const Rows& r, const int* cand, int cand_stride, int blk,
-          int* out, int out_stride, cudaStream_t s);
+          int* out, int out_stride, cudaStream_t s, const TopkScratch* sc = nullptr);
 /// Level one of the candidate pre-filter, row t: block b's score = the max over its blk positions of the r.n[t] the
 /// query sees; the block of its newest position is pinned; the top r.k[t] blocks -> out[t] (bm: scratch rows bm_stride).
 void cand_blocks(const float* score, long long stride, int T, const Rows& r, int blk, float* bm, long long bm_stride,
@@ -144,12 +167,18 @@ struct AttnScratch {
     int max_t = 0, cap = 0;     // queries, rows a query (at least the sel_stride)
 };
 constexpr int kAttnScratchT = 7;   // (the staged kernel wins from 8 queries: V100, Sun)
+// heads_per_block kAttnWmma (a prompt chunk's queries): on RDNA 3/4 (gfx11/gfx12), 16 heads a block on matrix cores - the
+// products in BF16 (the query and the probabilities as a high and a low part: within rounding of the FP32 kernels,
+// not their bits); on Ampere and newer (sm_80+) the same on the tensor cores (mma.sync, BF16; DS4_ATTN_MMA=0 for
+// the FP32 kernel); elsewhere, or DS4_ATTN_WMMA=0, as 0
+constexpr int kAttnWmma = 16;
 struct AttnRows {
     int win0[kWin], nwin[kWin], nsel[kWin];
     // gen: query t is a chunk's row t0 + t at position p0 + t0 + t (the window buffer: the ring's win rows before p0,
-    // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0
+    // then the chunk's), selecting min(kcap, (its position + 1) / R) compressed rows when R > 0; its window starts at
+    // position lo or later (0: the whole window - a truncated prompt's consumer layers see only its tail)
     int gen = 0, t0 = 0, win = 0, R = 0, kcap = 0;
-    long long p0 = 0;
+    long long p0 = 0, lo = 0;
 };
 void sparse_attn(const float* q, const uint16_t* win, const void* ckv, const int* sel, int sel_stride,
                  const AttnRows& a, const float* sink, int heads, int d, int T, float scale, float* out, cudaStream_t s,
@@ -171,15 +200,28 @@ struct RingBatch {
     int n = 0;
 };
 void ring_restore_batch(const RingBatch& b, int64_t p0, int n, int keep, int T, int d, cudaStream_t s);
+/// The compressors' state back to a window's first `keep` positions, up to kMaxRingBatch layers at once: each layer's
+/// snapshot (ratio x d kv, then ratio x d scores: the state before the window), then the kept rows (kv[t], score[t],
+/// t < keep) at their slots (p0 + t) % ratio - compress_win's state over the snapshot, its pools' latent rows left out.
+struct CompBatch {
+    float* kv_state[kMaxRingBatch] = {};
+    float* score_state[kMaxRingBatch] = {};
+    const float* snap[kMaxRingBatch] = {};
+    const float* kv[kMaxRingBatch] = {};
+    const float* score[kMaxRingBatch] = {};
+    int ratio[kMaxRingBatch] = {};
+    int n = 0;
+};
+void comp_restore_batch(const CompBatch& b, int64_t p0, int keep, int d, cudaStream_t s);
 
 /// Engram.  rows: n FP8 E4M3 rows of hd values, scales n x (hd / 32) E8M0 -> out F32 [n * hd].  q6k: the rows are
 /// ggml Q6_K superblocks instead (hd / 256 of them, 210 bytes each, at the start of each row's hd bytes; no scales),
 /// decoded as ggml's dequantize_row_q6_K.
-void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, bool q6k = false);
+void engram_dequant(const uint8_t* rows, const uint8_t* scales, int n, int hd, float* out, cudaStream_t s, int fmt = 0);
 /// The same over the host's per-token layout (a chunk): token t's cols rows, then their scales, `per` bytes a token;
 /// T tokens -> out F32 [T * cols][hd].
 void engram_dequant_tok(const uint8_t* src, size_t per, int cols, int T, int hd, float* out, cudaStream_t s,
-                        bool q6k = false);
+                        int fmt = 0);
 /// h[t][k] += gate[t][k] * value[t] with the gate from the normalized dot of h[t][k] * w[k] * key[t][k]
 /// (kv[t] = [key hc x dim | value dim]).
 void engram_gate(float* h, const float* kv, const float* w, int hc, int dim, int T, float eps, cudaStream_t s);
@@ -189,6 +231,8 @@ struct Gather {
     int src[kWin * kPicks];
 };
 void gather_rows(const float* x, const Gather& g, int n, int cols, float* out, cudaStream_t s);
+// bytes [col0, col0 + width) of each of `rows` rows of a matrix `pitch` bytes a row, side by side into out
+void gather_cols(const uint8_t* src, size_t pitch, size_t col0, size_t width, int rows, uint8_t* out, cudaStream_t s);
 /// The MoE's sum, token t: out[t] = sum_j w[t][j] ed[row[t][j]] (its VRAM experts, in pick order) + cpu[t] (when its
 /// cpu flag is set) + sh[t].
 struct Combine {
@@ -232,6 +276,14 @@ void route_publish(const float* logits, const float* bias, int n, int k, int T, 
 void route_ahead(const float* logits, const float* bias, int n, int m, int T, Req* req, int off, cudaStream_t s);
 /// Waits (one thread, on the device) until *seq_ptr == seq.
 void wait_seq(const unsigned* seq_ptr, unsigned seq, cudaStream_t s);
+/// The helper GPU's share of request seq (DS4_HELPER): waits on the device until req holds it - or a later one, or
+/// *quit: nothing taken - then its T tokens' picks the helper holds (tab[expert] its blob, 0: not held; n experts) into
+/// plan[t][i] (rows kPicks apart, every other entry 0) with their weights w[t][i], the tokens' x (dim floats each, rows
+/// back to back) into x, and seq into *ack: it has read the slot, which the host's answer lets the device write again.
+void helper_take(const Req* req, unsigned seq, int k, int dim, const unsigned long long* tab, int n,
+                 unsigned long long* plan, float* w, float* x, unsigned* ack, const unsigned* quit, cudaStream_t s);
+/// *flag = seq after a system fence: the stream's work before it (the helper's answer) is in place.
+void signal_seq(unsigned* flag, unsigned seq, cudaStream_t s);
 /// A chunk's routed experts as sorted rows: the picks (t, i < k) of T tokens (idx rows kPicks apart) by the virtual
 /// slot vs[expert] (n_vs of them: the VRAM slots, then the experts streamed in), each slot's rows in token order:
 /// bounds[n_vs + 1], row_tok[r], pos[t][i] (the pick's sorted row, rows kPicks apart).
@@ -262,7 +314,8 @@ void confidence(const float* x, const uint16_t* E, const int* tok, const float* 
                 cudaStream_t s);
 
 /// The pipeline's hand-offs and tensor parallelism, through host-mapped memory (these cards copy peer to peer only
-/// through the driver's staging).  xfer_put copies up to 4 segments (16-byte multiples, 16-byte aligned) device ->
+/// through the driver's staging).  xfer_put copies up to 4 segments (any size and alignment: each in 16-byte units
+/// where its ends and size are 16-byte multiples, else in 4-byte or single-byte units) device ->
 /// host-mapped, then (flag given) sets *flag = seq after a system fence (cnt: a device counter of the stream, 0
 /// between uses); xfer_get waits on the device until *flag >= seq, then copies host-mapped -> device.
 struct Xfer {
@@ -272,6 +325,9 @@ struct Xfer {
     int n = 0;
 };
 void xfer_put(const Xfer& x, unsigned* flag, unsigned seq, unsigned* cnt, cudaStream_t s);
+// Windows (WDDM, CUDA and HIP alike) holds launches back until the host waits or queries the stream: the work queued on
+// `s` submitted now (cudaStreamQuery, which does not wait).  Elsewhere nothing.  DS4_WIN_SUBMIT=0: off (A/B tests)
+void win_submit(cudaStream_t s);
 void xfer_get(const Xfer& x, const unsigned* flag, unsigned seq, cudaStream_t s);
 /// Waits (one thread) until flags[i * stride] >= seq for i < n (a pipelined chunk's readers have taken a buffer);
 /// set_flag: *flag = v after a system fence (a reader's acknowledgement).
@@ -291,6 +347,44 @@ struct ArGroup {
     unsigned* bflags = nullptr;
 };
 constexpr int kArBlocks = 64;
+/// *pairs[2i] = pairs[2i + 1] for i < n (pairs: host-mapped or device memory): table entries set in one launch
+void tab_set(const unsigned long long* pairs, int n, cudaStream_t s);
 void allreduce(float* x, int n, const ArGroup& a, int mi, unsigned seq, unsigned* cnt, cudaStream_t s);
+/// A chunk's all-reduce (three members or more) through the copy engines: allreduce's FP16 sums bit for bit (each
+/// partial rounded to FP16, each value summed in member order and rounded), the bytes moved by cudaMemcpyAsync where
+/// ar_rs16_kernel's loads read host memory a round trip at a time.  scratch: n * 4 + nm * 8 bytes on the device.
+/// The pieces allreduce_dma's phases overlap in (aux): a second stream for the copies out and events between them.
+constexpr int kArPieces = 4;
+struct ArAux {
+    cudaStream_t s2 = nullptr;
+    cudaEvent_t ev[1 + kArPieces] = {};
+};
+void allreduce_dma(float* x, int n, const ArGroup& a, int mi, unsigned seq, void* scratch, cudaStream_t s,
+                   const ArAux* aux = nullptr);
+/// A chunk's all-reduce summed by the host: each member's FP16 partial out on aux's stream (the D2H engine) in
+/// kArPieces pieces, the group's HostReducer sums each piece once every member's is in (ar_host_sum: ar_rs16_kernel's
+/// arithmetic), each member reads the sums back with the SMs - a member's H2D the row once, where the reduce-scatter
+/// read it nearly twice.  The group's lead submits each all-reduce (seq, n) to the reducer as it enqueues it.
+void ar_host_sum(const uint16_t* const* rows, int nm, uint16_t* out, size_t i0, size_t i1);
+/// pieces an all-reduce is cut in (DS4_AR_HOST_PIECES, 4; at most kArBlocks)
+int ar_host_pieces();
+class HostReducer {
+public:
+    /// devs: the members' CUDA devices (each one's partials in host memory on its NUMA node, the sums on the node most
+    /// of them are on); max_n: the most values an all-reduce has; threads: the sum's
+    HostReducer(const ArGroup& a, const std::vector<int>& devs, size_t max_n, int threads);
+    ~HostReducer();
+    bool ok() const;
+    void submit(unsigned seq, int n);
+    uint16_t* row(int m, int slot) const;   // member m's FP16 partials, slot `slot` (host-mapped)
+    uint16_t* sum(int slot) const;
+    HostReducer(const HostReducer&) = delete;
+    HostReducer& operator=(const HostReducer&) = delete;
+private:
+    struct Impl;
+    Impl* p_;
+};
+void allreduce_host(float* x, int n, const ArGroup& a, const HostReducer& hr, int mi, unsigned seq, void* scratch,
+                    cudaStream_t s, const ArAux& aux);
 
 }  // namespace strata::ds4
