@@ -73,9 +73,12 @@ and fixes for two-GPU Windows setups and the benchmark.
   stream-idle timeout no longer give up while the model is still writing (#403).
 - **Windows, GLM on two GPUs:** the RAM tier is pinned in pieces of at most 1 GB, so the second GPU gets its share of
   Windows' pinning budget instead of 0 GB and the start no longer fails (#417). `MAYA_GLM_PIN_PIECE_MB=0`: one block.
+  A capped split probes the room it keeps above its tier in pieces too, while one GPU probes its 512 MB in one block;
+  the pieces are freed through the same path (`fast_destroy`), so the pinned-bytes accounting stays exact.
 - **Fixes:** the server's queue no longer stays blocked after an engine restart handed out a request number still in
-  use (#330, @jettoblack); `--bench` sends DeepSeek its own chat format and `--report` shows DeepSeek's placement and
-  speed lines and its pictures setting (#416); `--mmap-experts` is a setup option kept by later setups (#422).
+  use (#330, @jettoblack); a failed engine restart over a process that will not end is no longer reported alive;
+  `--bench` sends DeepSeek its own chat format and `--report` shows DeepSeek's placement and speed lines and its
+  pictures setting (#416); `--mmap-experts` is a setup option kept by later setups (#422).
 
 ## v1.1.25 - 2026-10-23
 
