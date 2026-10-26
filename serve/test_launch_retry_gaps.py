@@ -217,6 +217,11 @@ FAKE = textwrap.dedent(r"""
         total = float(ram) if ram else float(os.environ["FAKE_AUTO_GB"])
         manual = os.environ.get("FAKE_MANUAL_FORCE") or (1 if ram else 0)
         sys.stderr.write("glm fast: RAM-TIER-OOM total_gb=%.2f manual=%s\n" % (total, manual))
+        sys.stderr.flush()
+        if os.path.exists(os.environ.get("FAKE_HANG_FILE", "")):   # its output closes, but the process runs on a while
+            os.close(1)
+            import time
+            time.sleep(float(os.environ.get("FAKE_HANG_S", "5")))
         sys.exit(1)
     sys.stdout.write("READY 4096\n"); sys.stdout.flush()
     for ln in sys.stdin:
@@ -382,6 +387,72 @@ class EngineOverFake(unittest.TestCase):
             e.restart()
         self.assertEqual(self.tries()[3:], ["38"])
         self.assertEqual(str(cm.exception), f"the engine exited before it was ready (see {self.log})")
+
+    def test_failed_restart_keeps_context_routes_and_remembered_size(self):
+        # restart() re-runs __init__ (our RAM-retry loop included); when that start fails max_context must go back to
+        # what it was (#351), the rid counter / route table must be the old objects, and ram_auto_gb must stay what worked
+        e = self.start()
+        rids, routes, lock = e._rids, e._routes, e._routes_lock
+        for okv in ("1", None):   # (RAM never fits: the retry loop gives up / another reason: no retry)
+            with self.subTest(okv):
+                if okv is None:
+                    self.okf.write_text("38")
+                    self.plainf.write_text("x")
+                else:
+                    self.okf.write_text(okv)
+                with self.assertRaises(RuntimeError):
+                    e.restart()
+                self.assertEqual(e.max_context, 4096)
+                self.assertEqual(e.ram_auto_gb, 38.0)
+                self.assertIs(e._rids, rids)
+                self.assertIs(e._routes, routes)
+                self.assertIs(e._routes_lock, lock)
+                self.assertTrue(e.info)   # (the info of the last good start is kept)
+        # the next restart, with the cause gone, starts at the remembered size again and is READY
+        self.plainf.unlink()
+        self.okf.write_text("38")
+        self.starts.unlink()
+        e.restart()
+        self.assertEqual(self.tries(), ["38"])
+        self.assertEqual(e.max_context, 4096)
+        self.assertEqual(e.ram_auto_gb, 38.0)
+
+    def test_failed_restart_over_a_process_that_will_not_end_is_not_alive(self):
+        # restart() -> __init__ -> _end_refused() closes the refused engine's stdin/stdout, but the process does not
+        # exit within the waits (and the kill does not take): the start fails.  alive() must then say False - with
+        # ended still False it said True and the next request wrote to the closed stdin (ValueError, not EngineDied)
+        e = self.start()
+        self.assertTrue(e.alive())
+        hang = Path(self.tmp.name) / "hang"
+        hang.write_text("x")
+        self.okf.write_text("1")   # (RAM never fits: the restart is refused with the OOM line, then _end_refused runs)
+        env = {**self.env, "FAKE_HANG_FILE": str(hang), "FAKE_HANG_S": "4"}
+        e.spawn = (e.spawn[0], e.spawn[1], e.spawn[2], e.spawn[3], env)
+        e.close()                           # (the running engine ends first: restart()'s kill is a no-op below)
+        for _ in range(100):                # ... and its pump has finished (it sets ended as its output closes)
+            if e.ended:
+                break
+            time.sleep(0.1)
+        self.assertTrue(e.ended)
+        real_popen, script = server.subprocess.Popen, Path(self.exe).parent / "fake_engine.py"
+
+        def direct(cmd, **kw):   # (the script itself, by the base interpreter: a .bat's cmd.exe or a venv's launcher stub
+            # would keep the output pipe open until the script ends)
+            return real_popen([getattr(sys, "_base_executable", sys.executable), str(script)], **kw)
+
+        with mock.patch.object(server, "ENGINE_END_WAIT_S", 0.3), mock.patch.object(server, "ENGINE_KILL_WAIT_S", 0.3), \
+                mock.patch.object(real_popen, "kill", lambda self: None), \
+                mock.patch.object(server.subprocess, "Popen", direct):
+            try:
+                with self.assertRaises(RuntimeError):
+                    e.restart()
+                self.assertIsNone(e.proc.poll())   # (the refused process is still running: the case under test)
+                self.assertTrue(e.proc.stdin.closed)
+                self.assertFalse(e.alive())
+                self.assertTrue(e.ended)
+            finally:
+                e.proc.wait(timeout=30)   # (the fake ends by itself after FAKE_HANG_S)
+        self.assertFalse(e.alive())
 
     def test_the_log_is_closed_before_the_error(self):
         e = object.__new__(StrataEngine)

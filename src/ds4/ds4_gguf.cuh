@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cuda_runtime.h>
+#include <string>
 
 namespace strata::ds4::gguf {
 
@@ -52,6 +53,11 @@ const char* type_name(int type);
 
 /// The per-stream scratch of the MXFP4 experts on the current device (once per stream, as x3::prepare).
 bool prepare(cudaStream_t s);
+/// DS4_Q8_BATCH=1: mv()'s int8 inputs a launch a call (its line the first time it is asked: the load asks it).
+bool q8_batch();
+/// DS4_Q8_CHECK=1: the batched rounding against the per-job one on device dev (load time) - false and err when any byte
+/// differs, a guard is written, or a CUDA call fails or does not end.
+bool q8_batch_check(int dev, std::string& err);
 
 /// x3::mv's contract for GGUF matrices (F32 activations): each job's m->fmt kFmtBF16 (raw = BF16 [n][ld], ld values a
 /// row), kFmtMXFP4 (raw = MXFP4 [n][k / 32] blocks, ld bytes a row; 0: mx_row_bytes(k)) - an expert's matrix in VRAM -
@@ -69,7 +75,7 @@ void moe_gate_up(const x3::MoeArgs& a, const float* x, float* h, cudaStream_t s)
 void moe_down(const x3::MoeArgs& a, const float* h, const float* sh_out, float* out, cudaStream_t s);
 bool win_experts(const x3::WinArgs& a, cudaStream_t s);
 void set_gate_up(const x3::SetArgs& a, const float* x, int ldx, const int* row_idx, uint16_t* h16, int ldh,
-                 cudaStream_t s);
+                 cudaStream_t s, const uint16_t* x16 = nullptr);   // (x16: x's rows_f16, ldx apart - the low-bit tiles read it)
 void set_down(const x3::SetArgs& a, const uint16_t* h16, int ldh, float* y, int ldy, cudaStream_t s);
 
 /// (tests) rows of k values (k % 256 == 0, rows k apart) rounded as the CPU lane rounds a low-bit expert's activations

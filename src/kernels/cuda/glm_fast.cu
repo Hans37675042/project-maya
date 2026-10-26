@@ -6,6 +6,7 @@
 // serial reference kernels - the values agree to float rounding, which the fast-vs-reference check in
 // glm_pack_test pins on the real model.
 #include "strata/kernels/glm_fast.hpp"
+#include "strata/kernels/glm_batch.hpp"   // mla_decode_v70 (Volta)
 #include "strata/kernels/exl3.hpp"
 #if defined(STRATA_USE_HIP)
 #include "strata/kernels/glm_expert_bench.hpp"
@@ -28,6 +29,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 
 #if defined(STRATA_USE_HIP)
 // The HC grid exchanges FP32 partials between workgroups. An agent-scope
@@ -68,6 +70,42 @@ __device__ __forceinline__ float warp_max(float v) {
     for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
     return v;
 }
+// warp_sum / warp_max's butterfly - partner lane ^ 16, 8, 4, 2, 1, each step v op v[lane ^ o] - with the partner read
+// across the VALU's lanes on RDNA3 (v_permlanex16 with the identity selects for ^16: a row's lane i reads lane i of the
+// other row; DPP row_xmask for 8, 4, 2, 1) instead of through LDS (__shfl_xor_sync is a ds_bpermute on AMD): the same
+// operations on the same values in the same order, so the same bits (glm_attn_bench checks it); elsewhere the shuffles
+#if defined(STRATA_USE_HIP) && defined(__GFX11__)
+__device__ __forceinline__ float lane_xor16(float v) {
+    const int i = __builtin_bit_cast(int, v);
+    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(i, i, 0x76543210, 0xfedcba98, false, false));
+}
+template<int Ctrl> __device__ __forceinline__ float lane_dpp(float v) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), Ctrl, 0xf, 0xf, false));
+}
+constexpr bool kLaneSum = true;
+__device__ __forceinline__ float warp_sum_lanes(float v) {
+    v += lane_xor16(v);
+    v += lane_dpp<0x168>(v);   // row_xmask:8
+    v += lane_dpp<0x164>(v);   // row_xmask:4
+    v += lane_dpp<0x162>(v);   // row_xmask:2
+    v += lane_dpp<0x161>(v);   // row_xmask:1
+    return v;
+}
+__device__ __forceinline__ float warp_max_lanes(float v) {
+    v = fmaxf(v, lane_xor16(v));
+    v = fmaxf(v, lane_dpp<0x168>(v));
+    v = fmaxf(v, lane_dpp<0x164>(v));
+    v = fmaxf(v, lane_dpp<0x162>(v));
+    v = fmaxf(v, lane_dpp<0x161>(v));
+    return v;
+}
+#else
+constexpr bool kLaneSum = false;
+__device__ __forceinline__ float warp_sum_lanes(float v) { return warp_sum(v); }
+__device__ __forceinline__ float warp_max_lanes(float v) { return warp_max(v); }
+#endif
+template<bool L> __device__ __forceinline__ float wsum(float v) { return L ? warp_sum_lanes(v) : warp_sum(v); }
+template<bool L> __device__ __forceinline__ float wmax(float v) { return L ? warp_max_lanes(v) : warp_max(v); }
 // block-wide sum; every thread gets the total.  sh: >= 32 floats.  blockDim % 32 == 0.
 __device__ __forceinline__ float block_sum(float v, float* sh) {
     const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, nw = blockDim.x >> 5;
@@ -2454,11 +2492,11 @@ __global__ void __launch_bounds__(HC_THREADS) hc2_kernel(const STRATA_GRID_CONST
 // (8 bf16 per lane per stream segment, uint4) BEFORE it computes its R values, the partial sums are reduced by whole
 // warps (lane = block) instead of one thread walking 32 of them, and the second barrier's total likewise.
 // 32 blocks of 128 embedding values; n_embd == 4096 only.
-__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+// (block b of nb; the kernel's body, one row's or - hc3_rows_kernel - each row's own blocks: grid y is the row)
+__device__ __forceinline__ void hc3_block(const HcArgs& a, const unsigned int nb, const int b) {
     const int hc = 4;
     const int n_embd = a.n_embd;
-    const unsigned int nb = gridDim.x;   // 32
-    const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int e0 = b * HC2_EB;
     unsigned long long* ctr = (unsigned long long*) a.counter;
     __shared__ float sR[4][HC2_EB];
@@ -2572,6 +2610,18 @@ __global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONST
         a.x[e] = xv;
         q8_1_store_warp(xv, (block_q8_1*) a.xq + e / 32, lane);
     }
+}
+__global__ void __launch_bounds__(HC_THREADS) hc3_kernel(const STRATA_GRID_CONSTANT HcArgs a) {
+    hc3_block(a, gridDim.x, blockIdx.x);   // 32 blocks
+}
+// STRATA_GLM_ROWS_BATCH: the rows of a batched decode step in one launch - row y's blocks are hc3_kernel's for its
+// args (its own partials and barrier counter): the same block function, so each row's arithmetic is meant to be the
+// one-row kernel's (glm_rows_kernels_test compares them bitwise)
+struct HcBatch {
+    HcArgs a[kMaxMvNt];
+};
+__global__ void __launch_bounds__(HC_THREADS) hc3_rows_kernel(const STRATA_GRID_CONSTANT HcBatch rb) {
+    hc3_block(rb.a[blockIdx.y], gridDim.x, blockIdx.x);
 }
 
 __global__ void hc_post_kernel(const float* __restrict__ block_out, const float* __restrict__ R_old,
@@ -2746,7 +2796,7 @@ struct KdaRecBatch {
 };
 __global__ void __launch_bounds__(256) kda_rec_layers_kernel(const STRATA_GRID_CONSTANT KdaRecBatch b) {
     const KdaRecArgs& r = b.a[blockIdx.y];
-    kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, nullptr, blockIdx.x);
+    kda_rec_block(r.q, r.k, r.v, r.g1, r.beta_raw, r.state, r.g2, r.norm_w, b.eps, (block_q8_1*) r.out, blockIdx.x);
 }
 
 // the DSA latent cache is FP16 (uint16_t bits): read / written in F32
@@ -2852,9 +2902,24 @@ __global__ void __launch_bounds__(512) dsa_prep_kernel(const STRATA_GRID_CONSTAN
     }
 }
 
+__device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                const float* __restrict__ iw, int key_dim, int idx_heads, int n_pools,
+                                                float* __restrict__ score);
 __global__ void __launch_bounds__(256) dsa_score_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
                                                         const float* __restrict__ iw, int key_dim, int idx_heads,
                                                         int n_pools, float* __restrict__ score) {
+    dsa_score_block(iq, pooled, iw, key_dim, idx_heads, n_pools, score);
+}
+// dsa_score of several rows (different sequences) in one launch: blockIdx.y the row, its blocks dsa_score_kernel's (a
+// row's blocks past its own (n_pools + 7) / 8 return at once)
+__global__ void __launch_bounds__(256) dsa_score_rows_kernel(DsaScoreRows a, int key_dim, int idx_heads) {
+    const int r = blockIdx.y;
+    if ((int) blockIdx.x * (int) (blockDim.x >> 5) >= a.n_pools[r]) return;
+    dsa_score_block(a.iq[r], a.pooled[r], a.iw[r], key_dim, idx_heads, a.n_pools[r], a.score[r]);
+}
+__device__ __forceinline__ void dsa_score_block(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                const float* __restrict__ iw, int key_dim, int idx_heads, int n_pools,
+                                                float* __restrict__ score) {
     extern __shared__ float s_iq[];   // idx_heads * key_dim, then idx_heads weights
     float* s_iw = s_iq + idx_heads * key_dim;
     for (int i = threadIdx.x; i < idx_heads * key_dim; i += blockDim.x) s_iq[i] = iq[i];
@@ -2874,8 +2939,75 @@ __global__ void __launch_bounds__(256) dsa_score_kernel(const float* __restrict_
     if (lane == 0) score[p] = acc;
 }
 
+// The indexer's scores, take two (STRATA_GLM_DSA_SCORE2, glm_attn_bench), idx_heads 32 x key_dim 128 only: each pool's
+// arithmetic is dsa_score_block's - every head's dot from the lane's four products in key order, the butterfly,
+// fmaxf(dot, 0) * w summed over the heads in order - so the same bits.  What changes is around it: dsa_score_kernel
+// fills 16 KB of query into LDS for every 8 pools; here a grid of a few blocks a CU fills it once a block (or each lane
+// keeps its 128 query values in registers: QR) and its warps loop over the pools, P at a time (independent chains),
+// the butterfly across the VALU's lanes (L: warp_sum_lanes) or through the shuffles.
+constexpr int kDsaH = 32, kDsaK = 128;
+template<bool QR, bool L, int P>
+__global__ void __launch_bounds__(256) dsa_score2_kernel(const float* __restrict__ iq, const float* __restrict__ pooled,
+                                                         const float* __restrict__ iw, int n_pools, float* __restrict__ score) {
+    __shared__ float s_iq[QR ? 1 : kDsaH * kDsaK];
+    __shared__ float s_iw[kDsaH];
+    const int lane = threadIdx.x & 31;
+    float q[QR ? kDsaH * 4 : 1];
+    if constexpr (QR) {
+#pragma unroll
+        for (int h = 0; h < kDsaH; ++h)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) q[h * 4 + i] = iq[h * kDsaK + lane + 32 * i];
+    } else {
+        for (int i = threadIdx.x; i < kDsaH * kDsaK; i += blockDim.x) s_iq[i] = iq[i];
+    }
+    if (threadIdx.x < kDsaH) s_iw[threadIdx.x] = iw[threadIdx.x];
+    __syncthreads();
+    const int nw = gridDim.x * (blockDim.x >> 5);
+    for (int p0 = (blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5)) * P; p0 < n_pools; p0 += nw * P) {
+        float pk[P][4], acc[P];
+#pragma unroll
+        for (int j = 0; j < P; ++j) {
+            acc[j] = 0.0f;
+            const float* pj = pooled + (size_t) kDsaK * min(p0 + j, n_pools - 1);   // (past the end: the last pool, unwritten)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) pk[j][i] = pj[lane + 32 * i];
+        }
+#pragma unroll
+        for (int h = 0; h < kDsaH; ++h) {
+            float dot[P];
+#pragma unroll
+            for (int j = 0; j < P; ++j) {
+                dot[j] = 0.0f;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) dot[j] += (QR ? q[h * 4 + i] : s_iq[h * kDsaK + lane + 32 * i]) * pk[j][i];
+            }
+#pragma unroll
+            for (int j = 0; j < P; ++j) dot[j] = wsum<L>(dot[j]);
+#pragma unroll
+            for (int j = 0; j < P; ++j) acc[j] += fmaxf(dot[j], 0.0f) * s_iw[h];
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int j = 0; j < P; ++j)
+                if (p0 + j < n_pools) score[p0 + j] = acc[j];
+        }
+    }
+}
+
+__device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
+                                                 int n_sel, int pos, int* __restrict__ cells);
 __global__ void __launch_bounds__(1024) dsa_select_kernel(const float* __restrict__ score, int n_vis, int kpool,
                                                           int top_pools, int n_sel, int pos, int* __restrict__ cells) {
+    dsa_select_block(score, n_vis, kpool, top_pools, n_sel, pos, cells);
+}
+// dsa_select of several rows (different sequences) in one launch: a block a row, each dsa_select_kernel's own code
+__global__ void __launch_bounds__(1024) dsa_select_rows_kernel(DsaSelectRows a, int kpool) {
+    const int r = blockIdx.x;
+    dsa_select_block(a.score[r], a.n_vis[r], kpool, a.top_pools[r], a.n_sel[r], a.pos[r], a.cells[r]);
+}
+__device__ __forceinline__ void dsa_select_block(const float* __restrict__ score, int n_vis, int kpool, int top_pools,
+                                                 int n_sel, int pos, int* __restrict__ cells) {
     for (int i = threadIdx.x; i < n_sel; i += blockDim.x) cells[i] = -1;
     __syncthreads();
     // the top pools in rank order (score descending, ties by the lower index), O(n_vis) - src/kernels/cuda/dsa_topk.cuh
@@ -3164,6 +3296,119 @@ __global__ void mla_combine_kernel(const float* __restrict__ part, int n_chunks,
     }
 }
 
+// The split attention, take two (STRATA_GLM_MLA_ATTN2, glm_attn_bench): every head's arithmetic is mla_split_kernel's
+// and mla_combine_kernel's - the same 32-cell chunks, each (head, cell) score from the lane's 16 products and the
+// butterfly, the chunk's max / exp / sum, each column's context over the chunk's cells in order, then the chunks merged
+// in order - so the same bits.  What changes is around it: HPB heads a block (each head is independent; 16 stages
+// every chunk four times over 64 heads, 64 once), the butterflies across the VALU's lanes (L), the chunk's latent rows
+// staged 16 bytes a lane (V, FP16 latents) instead of a division and a 2-byte load an element; and the merge
+// (mla_combine2_kernel) takes each chunk's exp factor once a block instead of once a column, 128 columns a block.
+template<int HPB, bool L, bool V>
+__global__ void __launch_bounds__(256) mla_split2_kernel(const float* __restrict__ q_abs, const uint16_t* __restrict__ lat,
+                                                         const int* __restrict__ cells, int n_sel, int n_head, int qk_nope,
+                                                         int kv_lora, float* __restrict__ part, bool q8) {
+    extern __shared__ float smem[];
+    uint16_t* sL = (uint16_t*) smem;                   // MLA_CHUNK x kv_lora, FP16
+    float* sS = smem + MLA_CHUNK * kv_lora / 2;        // HPB x MLA_CHUNK scores -> weights
+    __shared__ int s_cell[MLA_CHUNK];
+    const int b = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nw = blockDim.x >> 5;
+    const int h0 = blockIdx.y * HPB, nh = min(HPB, n_head - h0);
+    const int s0 = b * MLA_CHUNK;
+    const int ns = min(MLA_CHUNK, n_sel - s0);
+    if (tid < MLA_CHUNK) s_cell[tid] = tid < ns ? cells[s0 + tid] : -1;
+    __syncthreads();
+    if (V && !q8 && kv_lora % 8 == 0 && ((size_t) lat & 15) == 0) {
+        const int per = kv_lora / 8;                   // a row's 16-byte pieces (the same halves as the element loop)
+        for (int i = tid; i < MLA_CHUNK * per; i += blockDim.x) {
+            const int r = i / per, c8 = i - r * per;
+            const int cell = s_cell[r];
+            ((uint4*) sL)[i] = cell < 0 ? make_uint4(0u, 0u, 0u, 0u) : ((const uint4*) (lat + (size_t) kv_lora * cell))[c8];
+        }
+    } else {
+        for (int i = tid; i < MLA_CHUNK * kv_lora; i += blockDim.x) {
+            const int r = i / kv_lora, c = i - r * kv_lora;
+            const int cell = s_cell[r];
+            sL[i] = cell < 0 ? (uint16_t) 0 : q8 ? lat_h(lat_any(lat, true, kv_lora, cell, c)) : lat[(size_t) kv_lora * cell + c];
+        }
+    }
+    __syncthreads();
+    const float scale = rsqrtf((float) qk_nope);
+    for (int hh = warp; hh < nh; hh += nw) {
+        float q[16];
+        const float* qh = q_abs + (size_t) kv_lora * (h0 + hh);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) q[j] = (lane + 32 * j) < kv_lora ? qh[lane + 32 * j] : 0.0f;
+        for (int r = 0; r < MLA_CHUNK; ++r) {
+            float acc = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 16; ++j)
+                if (lane + 32 * j < kv_lora) acc += q[j] * lat_f(sL[r * kv_lora + lane + 32 * j]);
+            acc = wsum<L>(acc);
+            if (lane == 0) sS[hh * MLA_CHUNK + r] = s_cell[r] >= 0 ? acc * scale : -INFINITY;
+        }
+    }
+    __syncthreads();
+    float* pm = part + ((size_t) b * n_head + h0) * (kv_lora + 2);
+    for (int hh = warp; hh < nh; hh += nw) {
+        const float v = lane < MLA_CHUNK ? sS[hh * MLA_CHUNK + lane] : -INFINITY;
+        const float m = wmax<L>(v);
+        const float e = (v == -INFINITY) ? 0.0f : expf(v - m);
+        const float l = wsum<L>(e);
+        if (lane < MLA_CHUNK) sS[hh * MLA_CHUNK + lane] = e;
+        if (lane == 0) {
+            pm[(size_t) hh * (kv_lora + 2) + kv_lora] = m;
+            pm[(size_t) hh * (kv_lora + 2) + kv_lora + 1] = l;
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < nh * kv_lora; i += blockDim.x) {
+        const int hh = i / kv_lora, c = i - hh * kv_lora;
+        float acc = 0.0f;
+#pragma unroll 8
+        for (int r = 0; r < MLA_CHUNK; ++r) acc += sS[hh * MLA_CHUNK + r] * lat_f(sL[r * kv_lora + c]);
+        pm[(size_t) hh * (kv_lora + 2) + c] = acc;
+    }
+}
+
+// mla_combine_kernel's merge, each chunk's factor expf(m_b - M) taken once a block (thread 0 runs the original's M and
+// L loops in their order), a block a head and 128 columns; n_chunks <= kMlaCombine2Max (else the original)
+constexpr int kMlaCombine2Max = 256;
+__global__ void __launch_bounds__(128) mla_combine2_kernel(const float* __restrict__ part, int n_chunks, int n_head,
+                                                           int kv_lora, float* __restrict__ ctx) {
+    __shared__ float s_f[kMlaCombine2Max];
+    __shared__ unsigned char s_ok[kMlaCombine2Max];
+    __shared__ float s_ml[2];
+    const int h = blockIdx.x;
+    if (threadIdx.x == 0) {
+        float M = -INFINITY;
+        for (int b = 0; b < n_chunks; ++b) M = fmaxf(M, part[((size_t) b * n_head + h) * (kv_lora + 2) + kv_lora]);
+        float Lsum = 0.0f;
+        for (int b = 0; b < n_chunks; ++b) {
+            const float* pb = part + ((size_t) b * n_head + h) * (kv_lora + 2);
+            if (pb[kv_lora] != -INFINITY) Lsum += expf(pb[kv_lora] - M) * pb[kv_lora + 1];
+        }
+        s_ml[0] = M;
+        s_ml[1] = Lsum;
+    }
+    __syncthreads();
+    const float M = s_ml[0], Lsum = s_ml[1];
+    for (int b = threadIdx.x; b < n_chunks; b += blockDim.x) {
+        const float mb = part[((size_t) b * n_head + h) * (kv_lora + 2) + kv_lora];
+        s_ok[b] = mb != -INFINITY;
+        s_f[b] = mb != -INFINITY ? expf(mb - M) : 0.0f;
+    }
+    __syncthreads();
+    const float invL = Lsum > 0.0f ? 1.0f / Lsum : 0.0f;
+    const int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= kv_lora) return;
+    float acc = 0.0f;
+    for (int b = 0; b < n_chunks; ++b) {
+        const float* pb = part + ((size_t) b * n_head + h) * (kv_lora + 2);
+        if (s_ok[b]) acc += s_f[b] * pb[c];
+    }
+    ctx[(size_t) kv_lora * h + c] = acc * invL;
+}
+
 // mla_split_kernel's chunk on tensor cores (NVIDIA sm_80+, kv_lora 512): the scores are a 16-head x 32-cell product
 // over 512 latent values and the context a 16 x 512 product over the 32 cells, so FP16 mma.sync (F32 sums) takes both
 // instead of one shared-memory read per multiply-add.  q (with the score scale folded in) and the exp-weights enter as
@@ -3186,9 +3431,12 @@ constexpr int MLA_NC = 16;
 __host__ __device__ __forceinline__ int mla_cblk(int n_sel) {
     return max(MLA_CHUNK, ((n_sel + MLA_NC - 1) / MLA_NC + MLA_CHUNK - 1) / MLA_CHUNK * MLA_CHUNK);
 }
-// the tokens of one launch (blockIdx.z): each one's selected cell count
+// the tokens of one launch (blockIdx.z): each one's selected cell count; mla_attend_rows: each one's own latents and
+// cells too (tokens of different sequences: lat[tk] set), else the launch's lat and cells + tk * c_stride
 struct MlaToks {
     int n_sel[kMlaTokMax];
+    const uint16_t* lat[kMlaTokMax];
+    const int* cells[kMlaTokMax];
 };
 // a block: 16 heads of one token over its cells [blockIdx.x * cblk, + cblk), MLA_CHUNK at a time with a running max
 // and sum per head (the context rows rescaled when the max grows), so a block's partial covers cblk cells
@@ -3208,7 +3456,12 @@ __global__ void __launch_bounds__(128) mla_split_mma_kernel(const float* __restr
     if (c_begin >= n_sel) return;
     const int c_end = min(n_sel, c_begin + cblk);
     q_abs += tk * q_stride;
-    cells += tk * c_stride;
+    if (nt.lat[tk] != nullptr) {
+        lat = nt.lat[tk];
+        cells = nt.cells[tk];
+    } else {
+        cells += tk * c_stride;
+    }
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, g = lane >> 2, t = lane & 3;
     const int h0 = blockIdx.y * 16, nh = min(16, n_head - h0);
     float* pm = part + (((size_t) tk * MLA_NC + blockIdx.x) * n_head + h0) * (MLA_KV + 2);
@@ -4836,9 +5089,20 @@ namespace {
 // projections 52.5 -> 46.1 us, the router + shared expert 82.2 -> 77.7); K = 12288 / 16384 ran slower with it (the
 // 24-48 KB of LDS per block cost occupancy).
 std::atomic<int> g_mv_r{-1}, g_mv_u{2}, g_mv_wpb{8}, g_mv_lds{-1};
+// the most activations the RDNA kernels take at once (mv_rdna_launch<1..8>); more go to the other kernels
+constexpr int kMaxRdnaNt = 8;
 // The device the launch runs on: by default the RDNA 3.5 APUs (gfx115x - measured on a Radeon 8065S), whose LPDDR5X
 // latency the in-flight loads hide; STRATA_GLM_MV_RDNA=1 on any gfx11 (an RX 7900's GDDR6: not measured yet),
 // STRATA_GLM_MV_RDNA=0 keeps mv_kernel_t and the generic kernel (A/B)
+// Which dense GEMV kernels a device's decode runs, once per device: the engine's own record that MAYA_GLM_MV_RDNA reached
+// the dispatch - or did not
+void note_mv(int device, bool on) {
+    static std::atomic<unsigned> seen{0};
+    if (device < 0 || device >= 32) return;
+    const unsigned bit = 1u << device;
+    if (seen.fetch_or(bit) & bit) return;
+    std::fprintf(stderr, "glm mv: CUDA%d dense GEMVs on the %s\n", device, on ? "RDNA3 kernel" : "original kernels");
+}
 bool mv_rdna_device() {
     static const int mode = [] {   // -1: default, 0: off, 1: every gfx11
         const char* v = std::getenv("STRATA_GLM_MV_RDNA");
@@ -4854,6 +5118,7 @@ bool mv_rdna_device() {
         if (hipGetDeviceProperties(&prop, device) != hipSuccess) return false;
         on = std::strncmp(prop.gcnArchName, mode > 0 ? "gfx11" : "gfx115", mode > 0 ? 5 : 6) == 0;
         cached_device = device;
+        note_mv(device, on);
     }
     return on;
 }
@@ -4890,9 +5155,10 @@ void mv_rdna_launch(const MvBatch& b, int blocks, int r, int u, int wpb, int lds
         }
     }
 }
-// The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device.
+// The batch's Q6_K and BF16 jobs in one launch (BF16 first); marks them done.  False: not this device, or more than
+// kMaxRdnaNt activations (its kernels take 8 at most - the rest go to the other kernels).
 bool mv_rdna(const MvJob* jobs, int n, int nt, bool* done, cudaStream_t s) {
-    if (!mv_rdna_device()) return false;
+    if (nt > kMaxRdnaNt || !mv_rdna_device()) return false;
     int r = g_mv_r.load(std::memory_order_relaxed), u = g_mv_u.load(std::memory_order_relaxed);
     const int wpb = g_mv_wpb.load(std::memory_order_relaxed) == 4 ? 4 : 8;
     if (r < 0) { r = 1; u = 2; }
@@ -5028,7 +5294,7 @@ bool mv(const MvJob* jobs, int n, cudaStream_t s) {
         int idx[kMaxMvJobs], m = 0, nc = 0;
         for (int i = 0; i < n; ++i) {
             const MvJob& J = jobs[i];
-            const bool packed = J.ncol >= 2 && J.ncol <= kMaxMvNt && (J.type == kTypeBF16 || J.type == 14) &&
+            const bool packed = J.ncol >= 2 && J.ncol <= kMaxRdnaNt && (J.type == kTypeBF16 || J.type == 14) &&
                                 (J.xq == nullptr || J.xq_cstride == (int64_t) (J.n_in / 32) * (int64_t) sizeof(block_q8_1)) &&
                                 (J.xf == nullptr || J.xf_cstride == J.n_in) && J.y_cstride == J.n_out;
             if (!done[i] && packed && (nc == 0 || J.ncol == nc)) {
@@ -5266,6 +5532,49 @@ bool mv_nt(const MvJob* jobs, int n, int nt, cudaStream_t s) {
     static const bool typed = getenv("STRATA_GLM_MV_GENERIC") == nullptr;
     bool done[kMaxMvJobs] = {};
     if (!exl3_jobs(jobs, n, nt, done, s)) return false;   // (EXL3: one EXL3 job an activation)
+    if (nt > 8) {
+        // more activations than the kernels take (a verify window's rows, STRATA_GLM_MULTI_MTP): the rest in groups of
+        // 8 - each activation's output is mv()'s for it alone either way (the EXL3 jobs above took all nt at once)
+        for (int base = 0; base < nt; base += 8) {
+            const int w = std::min(8, nt - base);
+            MvJob part[kMaxMvJobs];
+            bool pd[kMaxMvJobs] = {};
+            int m = 0;
+            for (int i = 0; i < n; ++i) {
+                part[i] = jobs[i];
+                pd[i] = done[i];
+                if (done[i]) continue;
+                ++m;
+                if (part[i].xq != nullptr)
+                    part[i].xq = (const uint8_t*) jobs[i].xq + (size_t) base * (jobs[i].n_in / 32) * sizeof(block_q8_1);
+                if (part[i].xf != nullptr) part[i].xf = jobs[i].xf + (size_t) base * jobs[i].n_in;
+                part[i].y = jobs[i].y + (size_t) base * jobs[i].n_out;
+            }
+            if (m == 0) break;
+            if (w == 1) {
+                MvJob one[kMaxMvJobs];
+                int k = 0;
+                for (int i = 0; i < n; ++i)
+                    if (!pd[i]) one[k++] = part[i];
+                if (!mv(one, k, s)) return false;
+                continue;
+            }
+#if defined(STRATA_USE_HIP)
+            if (typed) mv_rdna(part, n, w, pd, s);
+#endif
+            switch (w) {
+                case 2: mv_nt_launch<2>(part, n, typed, pd, s); break;
+                case 3: mv_nt_launch<3>(part, n, typed, pd, s); break;
+                case 4: mv_nt_launch<4>(part, n, typed, pd, s); break;
+                case 5: mv_nt_launch<5>(part, n, typed, pd, s); break;
+                case 6: mv_nt_launch<6>(part, n, typed, pd, s); break;
+                case 7: mv_nt_launch<7>(part, n, typed, pd, s); break;
+                default: mv_nt_launch<8>(part, n, typed, pd, s); break;
+            }
+        }
+        launch_check("mv_nt");
+        return true;
+    }
 #if defined(STRATA_USE_HIP)
     if (typed) mv_rdna(jobs, n, nt, done, s);   // (RDNA3: its Q6_K and BF16 kernels take NT activations already)
 #endif
@@ -5287,13 +5596,19 @@ void quantize_q8_1(const float* x, void* xq, int n, cudaStream_t s) {
     launch_check("quantize");
 }
 
-void hc(const HcArgs& a, cudaStream_t s) {
-    // the grid-barrier kernel needs every block resident at once; checked once per process (and per device count
-    // of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).
+// hc's kernel: the grid-barrier kernel needs every block resident at once; checked once per process (and per device
+// count of SMs), the single-tail kernel otherwise.  STRATA_GLM_HC1=1 forces the old one (A/B).  cap_rows: how many
+// hc3_rows_kernel blocks the CURRENT device can hold resident at once - its own occupancy, not hc3_kernel's (a different
+// parameter block, so its registers can differ), since hc_rows' rows must all be resident for their grid barriers;
+// kept per device (a split's GPUs can differ)
+constexpr int kHcDevs = 64;
+static int hc_mode(const HcArgs& a, int* cap_rows = nullptr) {
     static int mode = -1;
+    static std::atomic<int> caps[kHcDevs];   // per device: its cap + 1 (0: not asked yet)
+    int dev = 0;
+    if (mode < 0 || cap_rows != nullptr) cudaGetDevice(&dev);
     if (mode < 0) {
-        int dev = 0, sms = 0, per = 0, per3 = 0;
-        cudaGetDevice(&dev);
+        int sms = 0, per = 0, per3 = 0;
         cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per, hc2_kernel, HC_THREADS, 0);
         cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3, hc3_kernel, HC_THREADS, 0);
@@ -5301,6 +5616,44 @@ void hc(const HcArgs& a, cudaStream_t s) {
         if (mode == 2 && getenv("STRATA_GLM_HC2") == nullptr && a.n_embd == 4096 && per3 * sms >= a.n_embd / HC2_EB)
             mode = 3;
     }
+    if (cap_rows != nullptr) {
+        int c1 = dev >= 0 && dev < kHcDevs ? caps[dev].load(std::memory_order_relaxed) : 1;   // (past 64: one a row)
+        if (c1 == 0) {
+            int sms = 0, per3r = 0;
+            cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev);
+            if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per3r, hc3_rows_kernel, HC_THREADS, 0) != cudaSuccess) {
+                cudaGetLastError();
+                per3r = 0;   // (unknown: one launch a row)
+            }
+            c1 = per3r * sms + 1;
+            caps[dev].store(c1, std::memory_order_relaxed);
+        }
+        *cap_rows = c1 - 1;
+    }
+    return mode;
+}
+
+void hc_rows(const HcArgs* a, int n, cudaStream_t s) {
+    if (n <= 0) return;
+    int cap = 0;
+    const int mode = hc_mode(a[0], &cap);
+    const bool one = n > 1 && n <= kMaxMvNt && mode == 3 && a[0].n_embd == 4096 && cap >= n * (a[0].n_embd / HC2_EB);
+    static std::atomic<bool> said[2] = {false, false};   // (each way said once: which one a run takes)
+    if (n > 1 && !said[one ? 1 : 0].exchange(true))
+        std::fprintf(stderr, "glm rows: hc of %d rows %s (hc mode %d, %d blocks resident at most, %d needed) - said once\n",
+                     n, one ? "in one launch" : "one launch a row", mode, cap, n * (a[0].n_embd / HC2_EB));
+    if (one) {
+        HcBatch b;
+        for (int i = 0; i < n; ++i) b.a[i] = a[i];
+        hc3_rows_kernel<<<dim3(a[0].n_embd / HC2_EB, n), HC_THREADS, 0, s>>>(b);
+        launch_check("hc3_rows");
+        return;
+    }
+    for (int i = 0; i < n; ++i) hc(a[i], s);
+}
+
+void hc(const HcArgs& a, cudaStream_t s) {
+    const int mode = hc_mode(a);
     if (mode == 3) {
         hc3_kernel<<<a.n_embd / HC2_EB, HC_THREADS, 0, s>>>(a);
         launch_check("hc3");
@@ -5368,17 +5721,183 @@ void kda_layers(const KdaPrepArgs* prep, const KdaRecArgs* rec, int n, float eps
     launch_check("kda_layers");
 }
 
+__global__ void __launch_bounds__(256) kda_gather_kernel(const STRATA_GRID_CONSTANT KdaGatherArgs a) {
+    const int i = blockIdx.x;
+    float* d = a.dst[i];
+    if (d == nullptr) return;
+    const size_t T = (size_t) a.tmax, t = (size_t) a.t[i], DI = (size_t) a.di, HD = (size_t) a.hd;
+    // (the layout of glm_window.cu's kda_in)
+    float* to[6] = {d + t * DI, d + (T + t) * DI, d + (2 * T + t) * DI, d + 3 * T * DI + t * HD,
+                    d + 3 * T * DI + (T + t) * HD, d + 3 * T * DI + 2 * T * HD + t * (size_t) a.nh};
+    const int w[6] = {a.di, a.di, a.di, a.hd, a.hd, a.nh};
+#pragma unroll
+    for (int p = 0; p < 6; ++p) {
+        const float* from = a.src[p] + (size_t) i * (size_t) w[p];
+        for (int e = threadIdx.x; e < w[p]; e += blockDim.x) to[p][e] = from[e];
+    }
+}
+
+void kda_gather(const KdaGatherArgs& a, cudaStream_t s) {
+    if (a.n_rows <= 0) return;
+    if (a.n_rows > kMaxMvNt) {
+        std::fprintf(stderr, "glm_fast kda_gather: %d rows (at most %d)\n", a.n_rows, kMaxMvNt);
+        return;
+    }
+    kda_gather_kernel<<<a.n_rows, 256, 0, s>>>(a);
+    launch_check("kda_gather");
+}
+
 void dsa_prep(const DsaPrepArgs& a, cudaStream_t s) {
     dsa_prep_kernel<<<3, 512, 0, s>>>(a);
     launch_check("dsa_prep");
 }
 
+namespace {
+// The take-two kernels' shapes, by label (glm_attn_bench prints the same labels):
+//   dsa_score2  [r|s][l|x][1|2]b<2|4|8|16> the query in registers or LDS, the butterfly across the lanes or through the
+//                                          shuffles, pools a warp at a time, blocks a multiprocessor (rl2b4, sx1b8, ...)
+//   mla_split2  h<16|32|64>[l|x][v|e][c|o] heads a block, lanes or shuffles, 16-byte or element staging, the one-pass
+//                                          merge or the original one (h64lvc, h16xeo, ...)
+// The engine takes them from STRATA_GLM_DSA_SCORE2 / STRATA_GLM_MLA_ATTN2 (unset or 0: the original kernels, which stay
+// the default; a value that is no label stops the process - a typo must never run the originals under a variant's
+// name); the bench sets them through hip_expert_bench.  The labels are exactly the ones glm_attn_bench --sweep checks.
+struct DsaScore2 {
+    bool on = false, qr = false, lanes = false;
+    int p = 1, bpc = 4;
+};
+struct MlaAttn2 {
+    bool on = false, lanes = false, vec = false, comb = false;
+    int hpb = 16;
+};
+bool parse_dsa2(const char* v, DsaScore2& t) {
+    t = DsaScore2{};
+    if (v == nullptr || v[0] == 0 || (v[0] == '0' && v[1] == 0) || std::string(v) == "original") return true;
+    const std::string l(v);
+    if (l.size() < 5 || (l[0] != 'r' && l[0] != 's') || (l[1] != 'l' && l[1] != 'x') || (l[2] != '1' && l[2] != '2') ||
+        l[3] != 'b')
+        return false;
+    int n = 0;
+    for (size_t i = 4; i < l.size(); ++i) {
+        if (l[i] < '0' || l[i] > '9' || n > 1000) return false;
+        n = n * 10 + (l[i] - '0');
+    }
+    if (n != 2 && n != 4 && n != 8 && n != 16) return false;
+    t.on = true;
+    t.qr = l[0] == 'r';
+    t.lanes = l[1] == 'l';
+    t.p = l[2] - '0';
+    t.bpc = n;
+    return true;
+}
+bool parse_mla2(const char* v, MlaAttn2& t) {
+    t = MlaAttn2{};
+    if (v == nullptr || v[0] == 0 || (v[0] == '0' && v[1] == 0) || std::string(v) == "original") return true;
+    const std::string l(v);
+    if (l.size() != 6 || l[0] != 'h') return false;
+    const std::string h = l.substr(1, 2);
+    if (h != "16" && h != "32" && h != "64") return false;
+    if ((l[3] != 'l' && l[3] != 'x') || (l[4] != 'v' && l[4] != 'e') || (l[5] != 'c' && l[5] != 'o')) return false;
+    t.on = true;
+    t.hpb = std::atoi(h.c_str());
+    t.lanes = l[3] == 'l';
+    t.vec = l[4] == 'v';
+    t.comb = l[5] == 'c';
+    return true;
+}
+std::string dsa2_label(const DsaScore2& t) {
+    return t.on ? std::string(1, t.qr ? 'r' : 's') + (t.lanes ? 'l' : 'x') + std::to_string(t.p) + "b" + std::to_string(t.bpc)
+                : "original";
+}
+std::string mla2_label(const MlaAttn2& t) {
+    return t.on ? "h" + std::to_string(t.hpb) + (t.lanes ? "l" : "x") + (t.vec ? "v" : "e") + (t.comb ? "c" : "o") : "original";
+}
+template<class T, bool (*Parse)(const char*, T&)>
+T env_shape(const char* name) {
+    T t;
+    const char* v = std::getenv(name);
+    if (!Parse(v, t)) {
+        std::fprintf(stderr, "glm_fast: %s=%s is not a take-two label - stopping (unset or 0: the original kernels)\n", name, v);
+        std::exit(2);
+    }
+    return t;
+}
+// the bench's override (written before the flag, read after it; the bench is one thread)
+std::atomic<int> g_dsa2_set{0}, g_mla2_set{0};
+DsaScore2 g_dsa2_bench;
+MlaAttn2 g_mla2_bench;
+DsaScore2 dsa2_shape() {
+    static const DsaScore2 env = env_shape<DsaScore2, parse_dsa2>("STRATA_GLM_DSA_SCORE2");   // (not STRATA_GLM_DSA_SCORE: the prompt's numeric switch, glm_batch.cu)
+    return g_dsa2_set.load(std::memory_order_acquire) ? g_dsa2_bench : env;
+}
+MlaAttn2 mla2_shape() {
+    static const MlaAttn2 env = env_shape<MlaAttn2, parse_mla2>("STRATA_GLM_MLA_ATTN2");
+    return g_mla2_set.load(std::memory_order_acquire) ? g_mla2_bench : env;
+}
+// the engine's own record of the kernels each device's attention runs, once per device (the dispatch proof)
+void note_kernel(std::atomic<unsigned>& seen, int device, const char* what, const std::string& label) {
+    if (device < 0 || device >= 32) return;
+    const unsigned bit = 1u << device;
+    if (seen.fetch_or(bit) & bit) return;
+    if (label == "original") std::fprintf(stderr, "glm %s: CUDA%d on the original kernels\n", what, device);
+    else std::fprintf(stderr, "glm %s: CUDA%d on the take-two kernels %s\n", what, device, label.c_str());
+}
+std::atomic<unsigned> g_dsa2_seen{0}, g_mla2_seen{0};
+int multiprocessors(int dev) {
+    static int n[16] = {};
+    if (dev < 0 || dev >= 16) return 48;
+    if (n[dev] == 0) {
+        int v = 0;
+        if (cudaDeviceGetAttribute(&v, cudaDevAttrMultiProcessorCount, dev) != cudaSuccess || v < 1) {
+            cudaGetLastError();
+            v = 48;
+        }
+        n[dev] = v;
+    }
+    return n[dev];
+}
+template<bool QR, bool L>
+void dsa_score2_launch(int p, int blocks, const float* iq, const float* pooled, const float* iw, int n_pools, float* score,
+                       cudaStream_t s) {
+    if (p == 2) dsa_score2_kernel<QR, L, 2><<<blocks, 256, 0, s>>>(iq, pooled, iw, n_pools, score);
+    else dsa_score2_kernel<QR, L, 1><<<blocks, 256, 0, s>>>(iq, pooled, iw, n_pools, score);
+}
+}  // namespace
+
 void dsa_score(const float* iq, const float* pooled, const float* iw, int key_dim, int idx_heads, int n_pools,
-               float* score, cudaStream_t s) {
+               float* score, cudaStream_t s, bool token) {
     if (n_pools <= 0) return;
+    // the take-two kernel on the decode's token path only (and under the bench's override); the record is the token
+    // path's - a prompt's windows, which keep the original, never write it
+    const bool path = token || g_dsa2_set.load(std::memory_order_acquire);
+    const DsaScore2 t = path ? dsa2_shape() : DsaScore2{};
+    const bool two = t.on && idx_heads == kDsaH && key_dim == kDsaK;
+    int dev = 0;
+    cudaGetDevice(&dev);
+    if (path) note_kernel(g_dsa2_seen, dev, "dsa scores", two ? dsa2_label(t) : std::string("original"));
+    if (two) {
+        const int blocks = std::max(1, std::min(t.bpc * multiprocessors(dev), (n_pools + 8 * t.p - 1) / (8 * t.p)));
+        if (t.qr) {
+            if (t.lanes) dsa_score2_launch<true, true>(t.p, blocks, iq, pooled, iw, n_pools, score, s);
+            else dsa_score2_launch<true, false>(t.p, blocks, iq, pooled, iw, n_pools, score, s);
+        } else {
+            if (t.lanes) dsa_score2_launch<false, true>(t.p, blocks, iq, pooled, iw, n_pools, score, s);
+            else dsa_score2_launch<false, false>(t.p, blocks, iq, pooled, iw, n_pools, score, s);
+        }
+        launch_check("dsa_score2");
+        return;
+    }
     const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
     dsa_score_kernel<<<(n_pools + 7) / 8, 256, smem, s>>>(iq, pooled, iw, key_dim, idx_heads, n_pools, score);
     launch_check("dsa_score");
+}
+
+void dsa_score_rows(const DsaScoreRows& a, int n, int key_dim, int idx_heads, cudaStream_t s) {
+    int most = 0;
+    for (int r = 0; r < n; ++r) most = std::max(most, a.n_pools[r]);
+    if (n < 1 || most < 1) return;
+    const size_t smem = ((size_t) idx_heads * key_dim + idx_heads) * sizeof(float);
+    dsa_score_rows_kernel<<<dim3((unsigned) ((most + 7) / 8), (unsigned) n), 256, smem, s>>>(a, key_dim, idx_heads);
+    launch_check("dsa_score_rows");
 }
 
 void dsa_select(const float* score, int n_vis, int kpool, int top_pools, int n_sel, int pos, int* cells,
@@ -5403,6 +5922,12 @@ bool dsa_select_all_on() {
     return on;
 }
 
+void dsa_select_rows(const DsaSelectRows& a, int n, int kpool, cudaStream_t s) {
+    if (n < 1) return;
+    dsa_select_rows_kernel<<<n, 1024, 0, s>>>(a, kpool);
+    launch_check("dsa_select_rows");
+}
+
 void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaStream_t s) {
     dsa_select_all_kernel<<<(n_sel + 255) / 256, 256, 0, s>>>(n_vis, kpool, n_sel, pos, cells);
     launch_check("dsa_select_all");
@@ -5411,7 +5936,64 @@ void dsa_select_all(int n_vis, int kpool, int n_sel, int pos, int* cells, cudaSt
 // the split attention of one token: q_abs (n_head x kv_lora) over its selected cells -> ctx; false when the split
 // kernels are not available on this device (mla() then runs its one-kernel form)
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
-                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8);
+                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token = false);
+
+#if defined(STRATA_USE_HIP)
+namespace {
+__global__ void lanes_kind_kernel(int* out) { *out = kLaneSum ? 1 : 0; }
+__global__ void warp_reduce_check_kernel(const float* __restrict__ in, float* sum_shfl, float* sum_lanes, float* max_shfl,
+                                         float* max_lanes, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const float v = i < n ? in[i] : 0.0f;
+    const float a = warp_sum(v), b = warp_sum_lanes(v), c = warp_max(v), d = warp_max_lanes(v);
+    if (i < n) {
+        sum_shfl[i] = a;
+        sum_lanes[i] = b;
+        max_shfl[i] = c;
+        max_lanes[i] = d;
+    }
+}
+}  // namespace
+namespace hip_expert_bench {
+bool dsa_score_config(const char* label) {
+    if (label == nullptr) {
+        g_dsa2_set.store(0, std::memory_order_release);
+        return true;
+    }
+    DsaScore2 t;
+    if (!parse_dsa2(label, t)) return false;
+    g_dsa2_bench = t;
+    g_dsa2_set.store(1, std::memory_order_release);
+    return true;
+}
+bool mla_attn_config(const char* label) {
+    if (label == nullptr) {
+        g_mla2_set.store(0, std::memory_order_release);
+        return true;
+    }
+    MlaAttn2 t;
+    if (!parse_mla2(label, t)) return false;
+    g_mla2_bench = t;
+    g_mla2_set.store(1, std::memory_order_release);
+    return true;
+}
+int lanes_kind(cudaStream_t s) {
+    int* d = nullptr;
+    int h = -1;
+    if (cudaMalloc(&d, sizeof(int)) != cudaSuccess) return -1;
+    lanes_kind_kernel<<<1, 1, 0, s>>>(d);
+    if (cudaMemcpyAsync(&h, d, sizeof(int), cudaMemcpyDeviceToHost, s) != cudaSuccess || cudaStreamSynchronize(s) != cudaSuccess) h = -1;
+    cudaFree(d);
+    return h;
+}
+void warp_reduce_check(const float* in, float* sum_shfl, float* sum_lanes, float* max_shfl, float* max_lanes, int n_warps,
+                       cudaStream_t s) {
+    const int n = n_warps * 32;
+    warp_reduce_check_kernel<<<(n + 255) / 256, 256, 0, s>>>(in, sum_shfl, sum_lanes, max_shfl, max_lanes, n);
+    launch_check("warp_reduce_check");
+}
+}  // namespace hip_expert_bench
+#endif
 
 void mla_q_abs(const float* q, int64_t q_stride, const uint16_t* wk_b, int n_head, int qk_nope, int kv_lora, int ncol,
                float* q_abs, int64_t qa_stride, cudaStream_t s) {
@@ -5500,12 +6082,50 @@ bool mla_attend_batch(const float* q_abs, int64_t q_stride, const uint16_t* lat,
     return true;
 }
 
+size_t mla_rows_part_floats(int n_head, int kv_lora) { return (size_t) MLA_NC * n_head * (kv_lora + 2); }
+
+bool mla_rows_ok(int kv_lora) {
+    int dev = 0;
+    cudaGetDevice(&dev);
+    return dev < 16 && kv_lora == MLA_KV && getenv("STRATA_GLM_MLA1") == nullptr && mla_mma_on(dev);
+}
+
+bool mla_attend_rows(const float* q_abs, int64_t q_stride, const uint16_t* const* lat, const int* const* cells,
+                     const int* n_sel, int T, int n_head, int qk_nope, int kv_lora, float* ctx, int64_t ctx_stride,
+                     float* part, int part_tokens, cudaStream_t s, bool lat_q8) {
+    if (T < 1 || part == nullptr || part_tokens < 1 || !mla_rows_ok(kv_lora)) return false;
+    const int G = std::min(part_tokens, kMlaTokMax);
+    for (int t0 = 0; t0 < T; t0 += G) {
+        const int nt = std::min(G, T - t0);
+        MlaToks tk{};
+        for (int i = 0; i < nt; ++i) {
+            tk.n_sel[i] = n_sel[t0 + i];
+            tk.lat[i] = lat[t0 + i];
+            tk.cells[i] = cells[t0 + i];
+        }
+        mla_split_mma_kernel<<<dim3(MLA_NC, (n_head + 15) / 16, nt), 128, MLA_MMA_SMEM, s>>>(
+            q_abs + t0 * q_stride, q_stride, lat[t0], cells[t0], 0, tk, n_head, qk_nope, part, lat_q8);
+        mla_combine_wide_kernel<<<dim3(n_head, (kv_lora + 127) / 128, nt), 128, 0, s>>>(part, tk, n_head, kv_lora,
+                                                                                         ctx + t0 * ctx_stride, ctx_stride);
+    }
+    launch_check("mla_attend_rows");
+    return true;
+}
+
 static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int* cells, int n_sel, int n_head,
-                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8) {
+                             int qk_nope, int kv_lora, float* ctx, cudaStream_t s, bool lat_q8, bool token) {
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev >= 16) return false;
     if (mla_attend_batch(q_abs, 0, lat, cells, 0, &n_sel, 1, n_head, qk_nope, kv_lora, ctx, 0, s, lat_q8)) return true;
+    // Volta: the prompt's one-pass tensor-core kernel in cell splits (STRATA_GLM_MLA_V70=0: the F32 chunks below)
+    if (kv_lora == 512 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr) {
+        int vcap = 0;
+        float* vpart = mla_part(dev, n_head, kv_lora, 64, &vcap);
+        if (vpart != nullptr && strata::kernels::glmb::mla_decode_v70(q_abs, lat, cells, n_sel, n_head, kv_lora,
+                                                                      1.0f / std::sqrt((float) qk_nope), ctx, vpart, vcap, s, lat_q8))
+            return true;
+    }
     const int n_chunks = (n_sel + MLA_CHUNK - 1) / MLA_CHUNK;
     const size_t smem = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) MLA_HPB * MLA_CHUNK * sizeof(float);
     static int attr_smem[16] = {};
@@ -5525,7 +6145,26 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
     float* part = split_ok[dev] && kv_lora <= 512 && n_head <= 128 && getenv("STRATA_GLM_MLA_ATTN1") == nullptr
                       ? mla_part(dev, n_head, kv_lora, n_chunks, &cap)
                       : nullptr;
-    if (part != nullptr && cap >= n_chunks) {
+    // the take-two kernels on the decode's token path only (and under the bench's override), as dsa_score
+    const bool path = token || g_mla2_set.load(std::memory_order_acquire);
+    const MlaAttn2 t2 = path ? mla2_shape() : MlaAttn2{};
+    if (path && part != nullptr && cap >= n_chunks) note_kernel(g_mla2_seen, dev, "mla split attention", mla2_label(t2));
+    if (part != nullptr && cap >= n_chunks && t2.on) {
+        const size_t smem2 = (size_t) MLA_CHUNK * kv_lora * sizeof(uint16_t) + (size_t) t2.hpb * MLA_CHUNK * sizeof(float);
+        const dim3 grid(n_chunks, (n_head + t2.hpb - 1) / t2.hpb);
+#define MLA2(H, L, V) mla_split2_kernel<H, L, V><<<grid, 256, smem2, s>>>(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, lat_q8)
+#define MLA2_HPB(H) do { if (t2.lanes) { if (t2.vec) MLA2(H, true, true); else MLA2(H, true, false); } \
+                         else { if (t2.vec) MLA2(H, false, true); else MLA2(H, false, false); } } while (0)
+        if (t2.hpb == 64) MLA2_HPB(64);
+        else if (t2.hpb == 32) MLA2_HPB(32);
+        else MLA2_HPB(16);
+#undef MLA2_HPB
+#undef MLA2
+        if (t2.comb && n_chunks <= kMlaCombine2Max)
+            mla_combine2_kernel<<<dim3(n_head, (kv_lora + 127) / 128), 128, 0, s>>>(part, n_chunks, n_head, kv_lora, ctx);
+        else
+            mla_combine_kernel<<<n_head, 256, 0, s>>>(part, n_chunks, n_head, kv_lora, ctx);
+    } else if (part != nullptr && cap >= n_chunks) {
         mla_split_kernel<<<dim3(n_chunks, (n_head + MLA_HPB - 1) / MLA_HPB), 256, smem, s>>>(
             q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, part, lat_q8);
         mla_combine_kernel<<<n_head, 256, 0, s>>>(part, n_chunks, n_head, kv_lora, ctx);
@@ -5538,7 +6177,11 @@ static bool mla_split_attend(const float* q_abs, const uint16_t* lat, const int*
 }
 
 void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint16_t* lat, const int* cells, int n_sel,
-         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8) {
+         int n_head, int qk_nope, int kv_lora, int v_head, void* out_q8_1, cudaStream_t s, bool lat_q8,
+         const MlaMarks* marks, bool token) {
+    const auto mark = [marks](const char* nm) {
+        if (marks) marks->fn(marks->ctx, nm);
+    };
     // scratch for q_abs and ctx (n_head * kv_lora each), per device
     static float* scratch[16] = {};
     int dev = 0;
@@ -5548,6 +6191,7 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
                                              (block_q8_1*) out_q8_1, lat_q8);
         launch_check("mla");
+        mark("mla");
         return;
     }
     if (scratch[dev] == nullptr && cudaMalloc(&scratch[dev], (size_t) 2 * n_head * kv_lora * sizeof(float)) != cudaSuccess) {
@@ -5557,16 +6201,20 @@ void mla(const float* q, const uint16_t* wk_b, const uint16_t* wv_b, const uint1
         mla_kernel<<<n_head, 256, smem, s>>>(q, wk_b, wv_b, lat, cells, n_sel, qk_nope, kv_lora, v_head,
                                              (block_q8_1*) out_q8_1, lat_q8);
         launch_check("mla");
+        mark("mla");
         return;
     }
     float* q_abs = scratch[dev];
     float* ctx = q_abs + (size_t) n_head * kv_lora;
     headwise_gemv_kernel<<<n_head * kv_lora / 32, 256, 0, s>>>(wk_b, q, kv_lora, qk_nope, q_abs, nullptr);
+    mark("mla_q_abs");
     // the split attention: chunks of MLA_CHUNK cells, partials per (chunk, head), then the merge (mla_split_attend)
-    mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8);
+    mla_split_attend(q_abs, lat, cells, n_sel, n_head, qk_nope, kv_lora, ctx, s, lat_q8, token);
+    mark("mla_attend");
     headwise_gemv_kernel<<<n_head * v_head / 32, 256, 0, s>>>(wv_b, ctx, v_head, kv_lora, nullptr,
                                                               (block_q8_1*) out_q8_1);
     launch_check("mla2");
+    mark("mla_out");
 }
 
 void swiglu_q8(const float* gate, const float* up, float limit, int n, void* hq, cudaStream_t s) {
@@ -5689,6 +6337,27 @@ bool rdna3_expert_device(bool allow_gfx1151 = true) {
     }
     return gfx1100 || (allow_gfx1151 && gfx1151);
 }
+// IQ2_S gate/up (Maya-M's) on IQ2_XXS's tuned path above - opt-in (STRATA_GLM_GU22_TUNED=1) until it is measured end
+// to end: the expert bench's sweep (--exact, gu22/down18) found it bit-identical to the original kernel on gfx1100 and
+// gfx1151 and 1.34-1.43x (gfx1100, device memory) / 1.12x (gfx1151, pinned host memory) faster at 4-8 experts a call
+bool gu22_tuned() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GLM_GU22_TUNED");
+        return v && v[0] == '1';
+    }();
+    return on;
+}
+// Which kernel IQ2_S gate/up ran, once per device and call path (0 the token path, 1 the window's multi-token launch):
+// the engine's own record that MAYA_GLM_GU22_TUNED reached the dispatch - or did not
+void note_gu22(bool tuned, int path) {
+    static std::atomic<unsigned> seen{0};
+    int dev = -1;
+    if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 16) return;
+    const unsigned bit = 1u << (dev * 2 + path);
+    if (seen.fetch_or(bit) & bit) return;
+    std::fprintf(stderr, "glm experts: CUDA%d IQ2_S gate/up on the %s kernel (%s)\n", dev, tuned ? "tuned RDNA" : "original",
+                 path ? "multi-token launch" : "token path");
+}
 // Splitting shared down removes its dynamic type switch from routed gate/up's
 // register budget. The routed grid keeps exactly the original dot/reduction order.
 __global__ void __launch_bounds__(256) rdna_shared_down_kernel(const uint8_t* weights, int type,
@@ -5729,10 +6398,16 @@ void moe_gate_up(int gu_type, const MoeDev& d_in, int k, int n_embd, int n_ff, f
     MoeDev d = d_in;
     d.skip = g_skip;
 #if defined(STRATA_USE_HIP)
-    if (gu_type == 16 && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device();
+    if (gu_type == 22) note_gu22(tuned, 0);
+    if (tuned) {
         // Packed sign expansion, original 16-wave/four-row geometry, grid in LDS.
-        launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
-            xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+        if (gu_type == 16)
+            launch_expert_gu<16, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+                xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
+        else
+            launch_expert_gu<22, 16, false, true, false, true>(d, k, n_embd, n_ff, limit,
+                xq, hq, sh_down, sh_type, sh_hq, n_ff_sh, sh_out, s);
         launch_check("moe_gate_up RDNA3");
         return;
     }
@@ -5880,9 +6555,15 @@ bool moe_experts_multi(int gu_type, int d_type, const MoeDev& d_in, int k, int n
     const auto* SH = (const block_q8_1*) sh_hq;
     // gate/up: moe_gate_up's kernel for the type, the (expert, token) blocks of a chunk side by side
     const dim3 ggu((unsigned) ((k + (sh ? 1 : 0)) * T), (unsigned) (n_ff / GU_ROWS));
-    if (gu_type == 16 && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device()) {
-        moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
-            d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+    const bool tuned = (gu_type == 16 || (gu_type == 22 && gu22_tuned())) && n_embd == 4096 && n_ff == 2048 && rdna3_expert_device();
+    if (gu_type == 22) note_gu22(tuned, 1);
+    if (tuned) {
+        if (gu_type == 16)
+            moe_gate_up_kernel<16, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
+        else
+            moe_gate_up_kernel<22, 16, true, false, false, true, false, 0, true><<<ggu, 16 * 32, 0, s>>>(
+                d, kk, n_embd, n_ff, limit, X, H, SD, sh_type, SH, n_ff_sh, sh_out);
     } else {
         switch (gu_type) {
 #define GLMF_GUM(TT) \
@@ -5935,15 +6616,18 @@ constexpr int kWinEnt = kMaxWinTokens * 8;
 // (the tables in shared memory: as locals they were a 2.6 KB stack a thread, which the driver reserves for every thread
 // the device can hold - ~420 MB on a V100 - and a launch failed "out of memory" once the expert pool had the rest)
 __global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
-    __shared__ unsigned long long gp[kWinEnt];
+    __shared__ unsigned long long gp[kWinEnt], pp[kWinEnt];
     __shared__ int cnt[kWinEnt], gof[kWinEnt], fill[kWinEnt + 1];
+    // the plan read by every thread at once (one thread's loads, one after another, took most of the kernel's time)
+    for (int e = threadIdx.x; e < w.T * 8; e += blockDim.x) pp[e] = (e & 7) < w.k ? w.plan_ptr[e] : 0ull;
+    __syncthreads();
     if (threadIdx.x != 0) return;
     int ng = 0;
     for (int t = 0; t < w.T; ++t)
         for (int i = 0; i < 8; ++i) {
             const int e = t * 8 + i;
             gof[e] = -1;
-            const unsigned long long p = i < w.k ? w.plan_ptr[e] : 0ull;
+            const unsigned long long p = pp[e];
             if (p == 0ull) continue;
             int g = 0;
             while (g < ng && gp[g] != p) ++g;
@@ -5964,6 +6648,50 @@ __global__ void moe_win_group_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
     for (int e = 0; e < w.T * 8; ++e)
         if (gof[e] >= 0) w.grp_ent[fill[gof[e]]++] = e;
     *w.n_groups = ng;
+}
+
+// moe_win_group_kernel's grouping with a thread an entry (STRATA_GLM_ROWS_SMALL): the same groups in the same order (by
+// each plan's first entry), the same members in entry order - every array it writes, value for value
+__global__ void __launch_bounds__(kWinEnt) moe_win_group_par_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
+    __shared__ unsigned long long sp[kWinEnt];
+    __shared__ int first[kWinEnt];
+    const int e = threadIdx.x, ne = w.T * 8;
+    unsigned long long p = 0ull;
+    if (e < ne && (e & 7) < w.k) p = w.plan_ptr[e];
+    sp[e] = p;
+    __syncthreads();
+    int f = -1;   // the entry's group: its plan's first entry
+    if (p != 0ull) {
+        f = e;
+        for (int j = 0; j < e; ++j)
+            if (sp[j] == p) {
+                f = j;
+                break;
+            }
+    }
+    first[e] = f;
+    __syncthreads();
+    if (f >= 0) {
+        int start = 0, pos = 0;   // the entries of the groups before this one; this one's members before it
+        for (int j = 0; j < ne; ++j) start += first[j] >= 0 && first[j] < f;
+        for (int j = 0; j < e; ++j) pos += first[j] == f;
+        w.grp_ent[start + pos] = e;
+        if (f == e) {
+            int g = 0;
+            for (int j = 0; j < e; ++j) g += first[j] == j;
+            w.grp_ptr[g] = p;
+            w.grp_start[g] = start;
+        }
+    }
+    if (e == 0) {
+        int ng = 0, tot = 0;
+        for (int j = 0; j < ne; ++j) {
+            ng += first[j] == j;
+            tot += first[j] >= 0;
+        }
+        w.grp_start[ng] = tot;
+        *w.n_groups = ng;
+    }
 }
 
 // grid (n_ff / GU_ROWS, groups): a group's expert's gate / up rows of this chunk against each member's FFN input, the
@@ -6055,9 +6783,10 @@ __global__ void moe_win_combine_kernel(const STRATA_GRID_CONSTANT MoeWin w) {
 
 }  // namespace
 
-bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
+bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s, bool par_group) {
     if (w.T < 1 || w.T > kMaxWinTokens || w.k > 8 || w.n_ff % GU_ROWS != 0 || w.n_embd % DOWN_ROWS != 0) return false;
-    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+    if (par_group) moe_win_group_par_kernel<<<1, kWinEnt, 0, s>>>(w);
+    else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
     const int G = w.T * w.k;   // groups at most (the blocks past the real count return at once)
     const dim3 ggu((unsigned) (w.n_ff / GU_ROWS), (unsigned) G), gdn((unsigned) (w.n_embd / DOWN_ROWS), (unsigned) G);
     switch (gu_type) {
@@ -6079,8 +6808,9 @@ bool moe_win_experts(int gu_type, int d_type, const MoeWin& w, cudaStream_t s) {
     return true;
 }
 
-void moe_win_group(const MoeWin& w, cudaStream_t s) {
-    moe_win_group_kernel<<<1, 32, 0, s>>>(w);
+void moe_win_group(const MoeWin& w, cudaStream_t s, bool par) {
+    if (par) moe_win_group_par_kernel<<<1, kWinEnt, 0, s>>>(w);
+    else moe_win_group_kernel<<<1, 32, 0, s>>>(w);
     launch_check("moe_win_group");
 }
 

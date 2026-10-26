@@ -3,6 +3,7 @@
 
 #undef NDEBUG   // the checks are asserts: keep them in Release builds
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -20,7 +22,7 @@
 
 namespace {
 using strata::core::glmfast::TierPin;
-constexpr int64_t kGi = int64_t{1} << 30, kMi = int64_t{1} << 20, kRoom = 512 * kMi;   // kRoom: kPinRoom
+constexpr int64_t kGi = int64_t{1} << 30, kMi = int64_t{1} << 20, kRoom = strata::core::glmfast::kPinRoomOneGpu;   // kRoom: kPinRoom
 
 // A driver with a pinning cap (STRATA_GLM_PIN_CAP_MB's model of Windows): it refuses what takes the bytes held past cap
 struct PinSim {
@@ -1677,6 +1679,473 @@ int main() {
                 if (!s.manual || s.auto_sized) each = false, why += flags(s) + " ";
             }
         check("tiersizing.user_size_budget_or_resident_is_manual", each, why);
+    }
+    {   // the RAM tier pinned in pieces (#417, STRATA_GLM_PIN_PIECE_MB): a class's slots split into pieces of at most
+        // piece_mb MB - each piece at least one slot, the pieces' slots summing to the class, only the last one shorter;
+        // piece_mb 0 is one block.  Every piece pinned is freed with the bytes it was pinned at (g_pin_held exact)
+        using strata::core::glmfast::pin_piece_slots;
+        using strata::core::glmfast::pin_piece_count;
+        using strata::core::glmfast::pin_piece_len;
+        using strata::core::glmfast::pin_pieces;
+        using strata::core::glmfast::free_pieces;
+        check("pieces.slots_per_piece_round_down", pin_piece_slots(1024, 37 * kMi) == 27,
+              std::to_string(pin_piece_slots(1024, 37 * kMi)));
+        check("pieces.slot_over_a_piece_is_a_piece_of_its_own", pin_piece_slots(1024, 2 * kGi) == 1,
+              std::to_string(pin_piece_slots(1024, 2 * kGi)));
+        check("pieces.zero_or_negative_mb_is_one_block", pin_piece_slots(0, 37 * kMi) == 0 && pin_piece_slots(-1, 37 * kMi) == 0);
+        check("pieces.huge_piece_clamps_to_int", pin_piece_slots(int64_t{1} << 40, 4096) == INT_MAX,
+              std::to_string(pin_piece_slots(int64_t{1} << 40, 4096)));
+        bool each = true;
+        std::string why;
+        for (const int64_t n : {1, 16, 26, 27, 28, 54, 55, 1000, 1001})
+            for (const int per : {0, 1, 27, 1000, 5000}) {
+                const size_t count = pin_piece_count(n, per);
+                const size_t want = per > 0 ? (size_t) ((n + per - 1) / per) : 1;
+                int64_t sum = 0;
+                bool ok = count == want;
+                for (size_t i = 0; i < count; ++i) {
+                    const int64_t len = pin_piece_len(n, per, i);
+                    sum += len;
+                    if (len < 1 || (per > 0 && len > per)) ok = false;
+                    if (per > 0 && i + 1 < count && len != per) ok = false;   // only the last one shorter
+                    if (per > 0 && i + 1 == count && n % per != 0 && len >= per) ok = false;
+                }
+                if (sum != n) ok = false;
+                if (!ok) {
+                    each = false;
+                    why += "n=" + std::to_string(n) + " per=" + std::to_string(per) + " count=" + std::to_string(count) +
+                           " sum=" + std::to_string(sum) + "; ";
+                }
+            }
+        check("pieces.lengths_sum_to_the_class_last_shorter", each, why);
+        check("pieces.an_empty_class_has_no_pieces", pin_piece_count(0, 27) == 0 && pin_piece_count(0, 0) == 0);
+        // a driver that refuses past a cap, and checks that each free names a live piece at the bytes it was pinned at
+        struct FakePin {
+            int64_t cap = 0, held = 0, allocs = 0;
+            std::map<uint8_t*, int64_t> live;
+            uintptr_t next = 1;
+            bool bad = false;
+        };
+        const auto run = [](FakePin& f, std::vector<uint8_t*>& parts, int64_t n, int per, int64_t stride) {
+            return pin_pieces(
+                parts, n, per, stride,
+                [&](int64_t bytes) -> uint8_t* {
+                    if (f.held + bytes > f.cap) return nullptr;
+                    uint8_t* p = (uint8_t*) (f.next++ << 12);
+                    f.live[p] = bytes;
+                    f.held += bytes;
+                    ++f.allocs;
+                    return p;
+                },
+                [&](uint8_t* p, int64_t bytes) {
+                    const auto it = f.live.find(p);
+                    if (it == f.live.end() || it->second != bytes) f.bad = true;
+                    else f.live.erase(it);
+                    f.held -= bytes;
+                });
+        };
+        const auto drop = [](FakePin& f, std::vector<uint8_t*>& parts, int64_t n, int per, int64_t stride) {
+            free_pieces(parts, n, per, stride, [&](uint8_t* p, int64_t bytes) {
+                const auto it = f.live.find(p);
+                if (it == f.live.end() || it->second != bytes) f.bad = true;
+                else f.live.erase(it);
+                f.held -= bytes;
+            });
+        };
+        const int64_t st = 37 * kMi;
+        {
+            FakePin f;
+            f.cap = 100 * kGi;
+            std::vector<uint8_t*> parts;
+            const bool ok = run(f, parts, 55, 27, st);
+            check("pieces.pin_takes_each_piece", ok && parts.size() == 3 && f.held == 55 * st && f.allocs == 3,
+                  std::to_string(parts.size()) + " pieces, " + std::to_string(f.held) + " bytes");
+            drop(f, parts, 55, 27, st);
+            check("pieces.free_gives_back_what_was_pinned", parts.empty() && f.held == 0 && f.live.empty() && !f.bad,
+                  std::to_string(f.held) + " bytes held");
+        }
+        {
+            FakePin f;
+            f.cap = 40 * st;   // the second piece (27..54) is refused
+            std::vector<uint8_t*> parts;
+            const bool ok = run(f, parts, 55, 27, st);
+            check("pieces.refused_piece_frees_the_ones_before", !ok && parts.empty() && f.held == 0 && f.live.empty() &&
+                                                                    !f.bad && f.allocs == 1,
+                  std::to_string(f.held) + " bytes held, " + std::to_string(f.allocs) + " allocs");
+        }
+        {
+            FakePin f;
+            f.cap = 100 * kGi;
+            std::vector<uint8_t*> parts;
+            const bool ok = run(f, parts, 55, 0, st);
+            check("pieces.zero_per_part_pins_one_block", ok && parts.size() == 1 && f.held == 55 * st,
+                  std::to_string(parts.size()));
+            drop(f, parts, 55, 0, st);
+            check("pieces.one_block_frees_whole", parts.empty() && f.held == 0 && !f.bad);
+        }
+        {   // (a FakePin of its own: no count left over from the earlier calls)
+            FakePin f;
+            f.cap = 100 * kGi;
+            std::vector<uint8_t*> none;
+            check("pieces.zero_slots_pin_nothing", !run(f, none, 0, 27, st) && none.empty() && f.allocs == 0 && f.held == 0 &&
+                                                       f.live.empty() && !f.bad);
+        }
+    }
+    {   // piece pinning, the edges the checks above leave: sizing limits, slot addressing across pieces, a refusal at
+        // every piece, and the bookkeeping on top of a nonzero baseline
+        using strata::core::glmfast::pin_piece_slots;
+        using strata::core::glmfast::pin_piece_count;
+        using strata::core::glmfast::pin_piece_len;
+        using strata::core::glmfast::pin_pieces;
+        using strata::core::glmfast::free_pieces;
+        check("pieces_edge.stride_exactly_a_piece_is_one_slot", pin_piece_slots(1024, 1024 * kMi) == 1 &&
+                                                                    pin_piece_slots(1024, 1024 * kMi + 1) == 1 &&
+                                                                    pin_piece_slots(1024, 512 * kMi) == 2 &&
+                                                                    pin_piece_slots(1024, 512 * kMi - 1) == 2);
+        check("pieces_edge.zero_or_negative_stride_is_one_block", pin_piece_slots(1024, 0) == 0 && pin_piece_slots(1024, -4096) == 0);
+        check("pieces_edge.one_byte_stride_fits_int", pin_piece_slots(1024, 1) == (int) (1024 * kMi) &&
+                                                          pin_piece_slots(4096, 1) == INT_MAX,
+              std::to_string(pin_piece_slots(1024, 1)) + " / " + std::to_string(pin_piece_slots(4096, 1)));
+        check("pieces_edge.int64_max_mb_does_not_overflow", pin_piece_slots(INT64_MAX, 1) == INT_MAX &&
+                                                                pin_piece_slots(INT64_MAX, 4096) == INT_MAX &&
+                                                                pin_piece_slots(INT64_MAX, INT64_MAX) >= 1,
+              std::to_string(pin_piece_slots(INT64_MAX, 4096)));
+        check("pieces_edge.single_piece_when_per_part_covers_n",
+              pin_piece_count(27, 27) == 1 && pin_piece_len(27, 27, 0) == 27 && pin_piece_count(5, 27) == 1 &&
+                  pin_piece_len(5, 27, 0) == 5 && pin_piece_count(5, INT_MAX) == 1 && pin_piece_len(5, INT_MAX, 0) == 5);
+        check("pieces_edge.exact_multiple_has_no_short_tail",
+              pin_piece_count(54, 27) == 2 && pin_piece_len(54, 27, 1) == 27 && pin_piece_count(55, 27) == 3 &&
+                  pin_piece_len(55, 27, 2) == 1);
+        check("pieces_edge.no_slots_or_past_the_end_is_empty",
+              pin_piece_len(0, 27, 0) == 0 && pin_piece_len(55, 27, 3) == 0 && pin_piece_len(55, 27, 99) == 0 &&
+                  pin_piece_count(-3, 27) == 0 && pin_piece_count(-3, 0) == 0 && pin_piece_len(55, 1, 54) == 1 &&
+                  pin_piece_len(55, 1, 55) == 0);
+        {   // RamClass::slot() (glm_fast_state.hpp, a CUDA header: mirrored here) - flat for one block, else piece + offset
+            struct Ram {
+                size_t stride = 0;
+                uint8_t* base = nullptr;
+                int n = 0, per_part = 0;
+                std::vector<uint8_t*> parts;
+                uint8_t* slot(size_t s) const {
+                    return per_part > 0 ? parts[s / (size_t) per_part] + (s % (size_t) per_part) * stride : base + s * stride;
+                }
+            };
+            bool ok = true;
+            std::string why;
+            for (const int n : {1, 26, 27, 28, 54, 55, 100})
+                for (const int per : {0, 1, 27, 1000}) {
+                    Ram r;
+                    r.stride = 4096 + 64;
+                    r.n = n;
+                    r.per_part = per;
+                    std::vector<std::vector<uint8_t>> mem;
+                    if (per > 0) {
+                        for (size_t i = 0; i < pin_piece_count(n, per); ++i) {
+                            mem.emplace_back((size_t) pin_piece_len(n, per, i) * r.stride);
+                            r.parts.push_back(mem.back().data());
+                        }
+                    } else {
+                        mem.emplace_back((size_t) n * r.stride);
+                        r.base = mem.back().data();
+                    }
+                    for (int s = 0; s < n; ++s) {
+                        uint8_t* p = r.slot((size_t) s);
+                        if (per <= 0) {
+                            if (p != r.base + (size_t) s * r.stride) { ok = false; why += "flat n=" + std::to_string(n) + "; "; }
+                            continue;
+                        }
+                        const size_t pc = (size_t) s / (size_t) per;
+                        const uint8_t* lo = r.parts[pc];
+                        const uint8_t* hi = lo + (size_t) pin_piece_len(n, per, pc) * r.stride;
+                        if (p < lo || p + r.stride > hi) {
+                            ok = false;
+                            why += "n=" + std::to_string(n) + " per=" + std::to_string(per) + " s=" + std::to_string(s) + "; ";
+                        }
+                    }
+                }
+            check("pieces_edge.slot_lies_inside_its_piece_and_flat_for_one_block", ok, why);
+        }
+        struct Fake {
+            int64_t held = 0, allocs = 0, frees = 0;
+            int fail_at = -1;                 // the alloc (0-based) that is refused; -1 never
+            std::map<uint8_t*, int64_t> live;
+            std::vector<int64_t> asked, freed;
+            uintptr_t next = 1;
+            bool bad = false;
+        };
+        const auto run = [](Fake& f, std::vector<uint8_t*>& parts, int64_t n, int per, int64_t stride) {
+            return pin_pieces(
+                parts, n, per, stride,
+                [&](int64_t bytes) -> uint8_t* {
+                    const int idx = (int) f.asked.size();
+                    f.asked.push_back(bytes);
+                    if (idx == f.fail_at) return nullptr;
+                    uint8_t* p = (uint8_t*) (f.next++ << 12);
+                    f.live[p] = bytes;
+                    f.held += bytes;
+                    ++f.allocs;
+                    return p;
+                },
+                [&](uint8_t* p, int64_t bytes) {
+                    const auto it = f.live.find(p);
+                    if (it == f.live.end() || it->second != bytes) f.bad = true;
+                    else f.live.erase(it);
+                    f.held -= bytes;
+                    ++f.frees;
+                    f.freed.push_back(bytes);
+                });
+        };
+        const int64_t st = 5 * kMi;
+        {   // 100 slots in pieces of 27: 27, 27, 27, 19 - a refusal at each piece frees exactly those before it
+            bool ok = true;
+            std::string why;
+            for (int k = 0; k < 4; ++k) {
+                Fake f;
+                f.held = 7 * st;   // other pinned memory already counted
+                f.fail_at = k;
+                std::vector<uint8_t*> parts;
+                const bool r = run(f, parts, 100, 27, st);
+                const bool good = !r && parts.empty() && f.held == 7 * st && f.live.empty() && !f.bad &&
+                                  f.allocs == k && f.frees == k && f.asked.size() == (size_t) k + 1;
+                std::vector<int64_t> want;
+                for (int i = 0; i < k; ++i) want.push_back(27 * st);
+                if (!good || f.freed != want) { ok = false; why += "k=" + std::to_string(k) + " held=" + std::to_string(f.held) + "; "; }
+            }
+            check("pieces_edge.refusal_at_each_piece_frees_only_the_pinned_ones_at_their_own_len", ok, why);
+        }
+        {   // a full pin: the asked sizes are each piece's own (the last one short); free returns held to the baseline
+            Fake f;
+            f.held = 7 * st;
+            std::vector<uint8_t*> parts;
+            const bool r = run(f, parts, 100, 27, st);
+            check("pieces_edge.full_pin_asks_each_pieces_own_bytes",
+                  r && parts.size() == 4 && f.asked == std::vector<int64_t>({27 * st, 27 * st, 27 * st, 19 * st}) &&
+                      f.held == (7 + 100) * st);
+            free_pieces(parts, 100, 27, st, [&](uint8_t* p, int64_t bytes) {
+                const auto it = f.live.find(p);
+                if (it == f.live.end() || it->second != bytes) f.bad = true;
+                else f.live.erase(it);
+                f.held -= bytes;
+                ++f.frees;
+            });
+            check("pieces_edge.free_returns_held_to_baseline", parts.empty() && f.held == 7 * st && f.live.empty() && !f.bad &&
+                                                                  f.frees == 4);
+            const int64_t before = f.frees;   // emptied vector: nothing left to free, no second release
+            free_pieces(parts, 100, 27, st, [&](uint8_t*, int64_t) { ++f.frees; });
+            check("pieces_edge.free_on_an_emptied_vector_is_a_noop", f.frees == before && parts.empty() && f.held == 7 * st);
+        }
+        {   // a stride over a piece: per_part 1, each slot its own piece; a refusal at the last frees the others
+            Fake f;
+            f.fail_at = 2;
+            std::vector<uint8_t*> parts;
+            const int per = pin_piece_slots(1024, 2 * kGi);
+            const bool r = run(f, parts, 3, per, 2 * kGi);
+            check("pieces_edge.oversize_slots_pin_one_per_piece",
+                  per == 1 && !r && f.allocs == 2 && f.frees == 2 && f.held == 0 && !f.bad &&
+                      f.freed == std::vector<int64_t>({2 * kGi, 2 * kGi}));
+        }
+        {   // per_part 0: a refusal of the single block leaves nothing to free; per_part >= n is one piece
+            Fake f;
+            f.fail_at = 0;
+            std::vector<uint8_t*> parts;
+            check("pieces_edge.single_block_refused_frees_nothing",
+                  !run(f, parts, 55, 0, st) && parts.empty() && f.frees == 0 && f.held == 0 &&
+                      f.asked == std::vector<int64_t>({55 * st}));
+            Fake g;
+            std::vector<uint8_t*> p2;
+            check("pieces_edge.per_part_over_n_is_one_piece",
+                  run(g, p2, 55, 5000, st) && p2.size() == 1 && g.asked == std::vector<int64_t>({55 * st}));
+        }
+    }
+    {   // pin_tier_classes wired as fast_setup wires it: pin = pin_pieces (then the room above the tier, probed in
+        // pieces), unpin = free_pieces, over one fake driver with a pinning cap.  Whatever path the cap sends the tier
+        // down (a refusal, the held-back unpin before any refusal, the measure_later re-pin), once the result is freed
+        // the driver holds no live piece, its counter is back at the baseline, and no free named a wrong size
+        namespace gf = strata::core::glmfast;
+        struct Drv {
+            int64_t cap = 0, held = 0, allocs = 0, frees = 0, refusals = 0;
+            std::map<uint8_t*, int64_t> live;
+            uintptr_t next = 1;
+            bool bad = false;
+            uint8_t* alloc(int64_t bytes) {
+                if (held + bytes > cap) return nullptr;
+                uint8_t* p = (uint8_t*) (next++ << 12);
+                live[p] = bytes;
+                held += bytes;
+                ++allocs;
+                return p;
+            }
+            void release(uint8_t* p, int64_t bytes) {
+                const auto it = live.find(p);
+                if (it == live.end() || it->second != bytes) bad = true;
+                else live.erase(it);
+                held -= bytes;
+                ++frees;
+            }
+            // MIRROR of glm_fast_path.cu pin_room - keep in sync
+            int64_t room(int64_t limit) {   // probes of 1 GiB, then kPinProbeStep, up to limit, freed again
+                std::vector<std::pair<uint8_t*, int64_t>> probes;
+                int64_t got = 0;
+                for (const int64_t probe : {kGi, gf::kPinProbeStep})
+                    while (got + probe <= limit) {
+                        uint8_t* q = alloc(probe);
+                        if (q == nullptr) break;
+                        probes.push_back({q, probe});
+                        got += probe;
+                    }
+                for (const auto& [q, b] : probes) release(q, b);
+                return got;
+            }
+        };
+        struct Run {
+            gf::TierPin tp;
+            bool ok = false;
+            std::vector<int> per;
+            std::vector<std::vector<uint8_t*>> parts;
+            std::vector<std::pair<char, size_t>> events;   // 'P' pin(c), 'U' unpin(c)
+            bool held_back() const {   // a class unpinned right after it pinned (before any refusal of the driver)
+                for (size_t i = 1; i < events.size(); ++i)
+                    if (events[i].first == 'U' && events[i - 1] == std::make_pair('P', events[i].second)) return true;
+                return false;
+            }
+        };
+        const std::vector<int64_t> stv = {6656 * 1024, 7168 * 1024};
+        // MIRROR of glm_fast_path.cu fast_setup pin/unpin/room lambdas - keep in sync
+        const auto drive = [&](Drv& d, Run& r, const std::vector<int64_t>& plan, int64_t later, int64_t reserve,
+                               bool measure_later, int64_t keep, int64_t piece_mb) {
+            const std::vector<int64_t> least = {16, 16};
+            r.per.assign(plan.size(), 0);
+            r.parts.assign(plan.size(), {});
+            const auto rel = [&](uint8_t* p, int64_t b) { d.release(p, b); };
+            r.ok = gf::pin_tier_classes(
+                r.tp, plan, stv, least, later, reserve, measure_later,
+                [&](size_t c, int64_t n) {
+                    r.events.push_back({'P', c});
+                    r.per[c] = gf::pin_piece_slots(piece_mb, stv[c]);
+                    if (!gf::pin_pieces(r.parts[c], n, r.per[c], stv[c], [&](int64_t b) { return d.alloc(b); }, rel)) {
+                        ++d.refusals;
+                        return false;
+                    }
+                    // MIRROR of fast_setup room_above - keep in sync
+                    // (the room kept above the tier pins too: in pieces for a split's, as one block for one GPU's)
+                    if (gf::pin_room_in_pieces(piece_mb, keep)) {
+                        if (d.room(keep) >= keep) return true;
+                    } else if (uint8_t* above = d.alloc(keep)) {
+                        d.release(above, keep);
+                        return true;
+                    }
+                    gf::free_pieces(r.parts[c], n, r.per[c], stv[c], rel);
+                    ++d.refusals;
+                    return false;
+                },
+                [&](size_t c, int64_t n) {
+                    r.events.push_back({'U', c});
+                    gf::free_pieces(r.parts[c], n, r.per[c], stv[c], rel);
+                },
+                [&](int64_t limit, bool) { return d.room(limit); });
+        };
+        const auto release_all = [&](Drv& d, Run& r) {   // the result freed as fast_destroy frees it
+            for (size_t c = 0; c < r.parts.size(); ++c)
+                gf::free_pieces(r.parts[c], c < r.tp.n.size() ? r.tp.n[c] : 0, r.per[c], stv[c],
+                                [&](uint8_t* p, int64_t b) { d.release(p, b); });
+        };
+        int runs = 0, held_back_runs = 0, repin_runs = 0, refused_runs = 0, failed_runs = 0;
+        bool clean = true, exact = true;
+        std::string why_clean, why_exact;
+        const int64_t small = 64 * kMi;
+        const std::vector<int64_t> plan = {(3 * kGi) / stv[0], (4 * kGi) / stv[1]};
+        // one GPU; a split's first part (the room kept 1.5 GiB for 2 GPUs under a cap) that measures the later part's
+        // room after its tier, and one that does not; the same in pieces of 256 MiB and in one block (piece_mb 0)
+        struct Cfg { int64_t piece_mb, later, reserve, keep; bool measure_later; };
+        const std::vector<Cfg> cfgs = {
+            {1024, 0, kRoom, kRoom, false},
+            {1024, 3 * kGi, 3 * kRoom + small, 3 * kRoom, true},
+            {1024, 3 * kGi, 3 * kRoom + small, 3 * kRoom, false},
+            {256, 3 * kGi, 3 * kRoom + small, 3 * kRoom, true},
+            {0, 3 * kGi, 3 * kRoom + small, 3 * kRoom, true},
+            {0, 0, kRoom, kRoom, false}};
+        std::vector<std::array<int, 4>> per_cfg(cfgs.size());   // held_back, repin, refused, failed
+        for (size_t ci = 0; ci < cfgs.size(); ++ci)
+            for (int64_t cap = small; cap <= 11 * kGi; cap += 97 * kMi + 12345) {
+                const Cfg& cfg = cfgs[ci];
+                Drv d;
+                d.cap = cap;
+                d.held = small;   // (the part's small pinned buffers: a baseline that is not 0)
+                Run r;
+                drive(d, r, plan, cfg.later, cfg.reserve, cfg.measure_later, cfg.keep, cfg.piece_mb);
+                ++runs;
+                if (r.held_back()) ++held_back_runs, ++per_cfg[ci][0];
+                if (r.tp.repinned) ++repin_runs, ++per_cfg[ci][1];
+                if (d.refusals > 0) ++refused_runs, ++per_cfg[ci][2];
+                if (!r.ok) ++failed_runs, ++per_cfg[ci][3];
+                // what is pinned now is exactly the tier the result names (probes and refused pieces gave theirs back)
+                int64_t tier = 0;
+                for (size_t c = 0; c < r.tp.n.size(); ++c) tier += r.tp.n[c] * stv[c];
+                if ((r.ok && d.held != small + tier) || d.bad) {
+                    exact = false;
+                    why_exact += "piece_mb=" + std::to_string(cfg.piece_mb) + " cap=" + std::to_string(cap) + " held=" +
+                                 std::to_string(d.held) + " tier=" + std::to_string(tier) + "; ";
+                }
+                release_all(d, r);
+                if (!d.live.empty() || d.held != small || d.bad) {
+                    clean = false;
+                    why_clean += "piece_mb=" + std::to_string(cfg.piece_mb) + " cap=" + std::to_string(cap) + " live=" +
+                                 std::to_string(d.live.size()) + " held=" + std::to_string(d.held - small) +
+                                 (d.bad ? " BAD" : "") + "; ";
+                }
+            }
+        check("pin_tier.pinned_bytes_are_exactly_the_tier_in_pieces", exact, why_exact);
+        check("pin_tier.freed_result_leaves_no_live_piece_and_no_mismatched_free", clean, why_clean);
+        check("pin_tier.sweep_drives_every_path", held_back_runs > 0 && repin_runs > 0 && refused_runs > 0 && failed_runs > 0,
+              "runs=" + std::to_string(runs) + " held_back=" + std::to_string(held_back_runs) + " repin=" +
+                  std::to_string(repin_runs) + " refused=" + std::to_string(refused_runs) + " failed=" +
+                  std::to_string(failed_runs));
+        // per configuration: every piece config reaches a refusal and a failed start; the ones with a later part (a
+        // split's first part) also reach the held-back unpin and the re-pin.  The one-GPU piece config (0) has no later
+        // part to hold room for, so those two paths are not asserted for it (the sweep shows 0 of each)
+        for (size_t ci = 0; ci < cfgs.size(); ++ci) {
+            if (cfgs[ci].piece_mb <= 0) continue;
+            const std::string name = "pin_tier.sweep_piece_cfg" + std::to_string(ci) + "_drives_";
+            const std::string got = " held_back=" + std::to_string(per_cfg[ci][0]) + " repin=" +
+                                    std::to_string(per_cfg[ci][1]) + " refused=" + std::to_string(per_cfg[ci][2]) +
+                                    " failed=" + std::to_string(per_cfg[ci][3]);
+            check((name + "refusal_and_failure").c_str(), per_cfg[ci][2] > 0 && per_cfg[ci][3] > 0, got);
+            if (cfgs[ci].later > 0) check((name + "held_back_and_repin").c_str(), per_cfg[ci][0] > 0 && per_cfg[ci][1] > 0, got);
+        }
+        for (size_t ci = 0; ci < cfgs.size(); ++ci)
+            std::printf("  cfg %zu piece_mb=%lld: %d held back, %d re-pinned, %d refused, %d failed\n", ci,
+                        (long long) cfgs[ci].piece_mb, per_cfg[ci][0], per_cfg[ci][1], per_cfg[ci][2], per_cfg[ci][3]);
+        std::printf("pin_tier sweep: %d runs, %d held back, %d re-pinned, %d with a refusal, %d failed\n", runs,
+                    held_back_runs, repin_runs, refused_runs, failed_runs);
+    }
+    {   // the room kept above the RAM tier: probed in pieces only for a split's several-GPU room, never for one GPU's
+        // (#417); and the piece size's default
+        namespace gf = strata::core::glmfast;
+        static_assert(gf::kPinRoomOneGpu % gf::kPinProbeStep == 0, "one GPU's room is a multiple of the probe step");
+        check("pin_room.one_gpu_room_stays_one_block", !gf::pin_room_in_pieces(1024, kRoom) && !gf::pin_room_in_pieces(256, kRoom));
+        check("pin_room.split_room_under_a_cap_is_probed_in_pieces",
+              gf::pin_room_in_pieces(1024, 3 * kRoom) && gf::pin_room_in_pieces(1024, 4 * kRoom) &&
+                  gf::pin_room_in_pieces(1024, kRoom + 256 * kMi));
+        check("pin_room.tier_in_one_block_keeps_the_room_one_block",
+              !gf::pin_room_in_pieces(0, 3 * kRoom) && !gf::pin_room_in_pieces(-1, 3 * kRoom));
+        check("pin_room.keep_off_the_probe_step_stays_one_block",
+              !gf::pin_room_in_pieces(1024, 3 * kRoom + 1) && !gf::pin_room_in_pieces(1024, 3 * kRoom - kMi) &&
+                  !gf::pin_room_in_pieces(1024, 0) && !gf::pin_room_in_pieces(1024, -3 * kRoom));
+        bool kept_ok = true;   // every keep fast_setup builds (pin_room_kept) is a multiple of the step; in pieces iff a capped split
+        for (int parts = 1; parts <= 16; ++parts)
+            for (const bool capped : {false, true}) {
+                const int64_t keep = gf::pin_room_kept(gf::kPinRoomOneGpu, parts, capped);
+                if (keep % gf::kPinProbeStep != 0 || gf::pin_room_in_pieces(1024, keep) != (capped && parts > 1)) kept_ok = false;
+            }
+        check("pin_room.every_built_keep_is_a_multiple_of_the_step_and_pieces_iff_a_capped_split", kept_ok);
+        check("pin_piece_mb.unset_is_the_platform_default", gf::pin_piece_mb(nullptr) == gf::pin_piece_mb_default());
+#ifdef _WIN32
+        check("pin_piece_mb.windows_default_is_1024", gf::pin_piece_mb_default() == 1024 && gf::kPinPieceMbWindows == 1024);
+#else
+        check("pin_piece_mb.default_elsewhere_is_one_block", gf::pin_piece_mb_default() == 0);
+#endif
+        check("pin_piece_mb.a_set_value_wins_zero_included",
+              gf::pin_piece_mb("0") == 0 && gf::pin_piece_mb("512") == 512 && gf::pin_piece_mb("4096") == 4096);
     }
     std::printf("dual-pin checks: %d run, %d expected failures, %d bad\n", g_checks, g_xfail, g_bad);
     if (g_bad) return 1;

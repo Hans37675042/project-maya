@@ -162,6 +162,8 @@ target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
 target_compile_definitions(strata-dequant PRIVATE STRATA_DEQUANT_SELFTEST)
 if(STRATA_BUILD_TESTS)
+  add_executable(ds4_prefill_stats_test tests/ds4_prefill_stats_test.cpp)
+  add_test(NAME ds4_prefill_stats_test COMMAND ds4_prefill_stats_test)
   # the reader refuses a duplicate tensor name at open, naming it (a synthetic GGUF: no model, no GPU)
   add_executable(gguf_reader_test src/artifact/gguf_reader_test.cpp)
   target_link_libraries(gguf_reader_test PRIVATE strata_artifact)
@@ -297,6 +299,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME glm_moe_rows_test COMMAND glm_moe_rows_test)
     set_tests_properties(glm_moe_rows_test PROPERTIES TIMEOUT 60)
   endif()
+  # the batched rows' one-launch kernels (hc_rows, kda_layers over the rows, mv_nt) against the per-row kernels, bitwise
+  # (random inputs, no model)
+  if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
+    add_executable(glm_rows_kernels_test tests/glm_rows_kernels_test.cu)
+    target_link_libraries(glm_rows_kernels_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_rows_kernels_test COMMAND glm_rows_kernels_test)
+    set_tests_properties(glm_rows_kernels_test PROPERTIES TIMEOUT 120)
+    # the rows' DSA attention in one launch (STRATA_GLM_ROWS_ATTN) against mla() a row, resident and streamed caches
+    add_executable(glm_rows_attn_test tests/glm_rows_attn_test.cu)
+    target_link_libraries(glm_rows_attn_test PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    add_test(NAME glm_rows_attn_test COMMAND glm_rows_attn_test)
+    set_tests_properties(glm_rows_attn_test PROPERTIES TIMEOUT 300)
+  endif()
   # the INT8 latent records' FP16 reads against the plain conversion, every code x every scale (GPU, no model)
   if(STRATA_BUILD_TESTS)
     add_executable(glm_lat8_test tests/glm_lat8_test.cu)
@@ -350,6 +365,9 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # FMA changes tie results. The embedding gather also relies on separately rounded operations.
     set_source_files_properties(src/kernels/cuda/elementwise.cu src/kernels/cuda/quantize_act.cu
       PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+    # EXL3: multiply-adds fused where the source writes them, not after inlining - otherwise a kernel's rounding
+    # depends on where the compiler inlined its GEMV, and a verify window's bits stop matching the token path's
+    set_source_files_properties(src/kernels/cuda/exl3.cu PROPERTIES COMPILE_OPTIONS "-ffp-contract=on")
   endif()
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
@@ -385,7 +403,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_library(strata_engine STATIC src/core/layer.cpp src/core/session.cpp src/core/expert_source.cpp src/core/remote_experts.cpp
     src/core/expert_cache.cpp src/core/native_head.cpp src/core/native_dense.cpp src/core/verify.cpp src/core/mtp.cpp
     src/core/glm_model.cu src/core/glm_fast_path.cu src/core/glm_prefill.cu src/core/glm_multi.cu src/core/glm_rows.cu
-    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu)
+    src/core/glm_window.cu src/core/glm_dflash.cu src/core/glm_mtp.cu src/core/glm_mtp_rows.cu)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
   if(STRATA_BUILD_TESTS AND STRATA_ENABLE_CUDA)
@@ -409,12 +427,19 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     set_tests_properties(file_expert_source_test PROPERTIES TIMEOUT 60)
   endif()
   # --expert-profile-save's profile (rank_learned_profile, write_expert_profile) and the profile header's version
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the EXL3 prompt
+  # experts' tensor-core switch by chunk length (exl3_mma_rows): CPU only
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups); where a read cuts to
+  # keep its system prompt's state (prefix_cut): CPU only
   # (a version other than 1 is refused by its number); the split decode's groups (split_groups): CPU only
-  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test)
+  # (a version other than 1 is refused by its number); the split decode's groups (split_groups); the pieces a prompt is
+  # read in between decode steps (prefill_pieces): CPU only
+  foreach(_t expert_profile_save_test expert_profile_version_test split_groups_test exl3_mma_rows_test prefix_cut_test mtp_rows_test prefill_pieces_test)
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/core/${_t}.cpp")
       enable_testing()
       add_executable(${_t} tests/core/${_t}.cpp)
-      target_link_libraries(${_t} PRIVATE strata_engine)
+      # (strata_prefill after strata_engine, as the engines link: on HIP glm_prefill.cu uses its Gemm - #355)
+      target_link_libraries(${_t} PRIVATE strata_engine strata_prefill)
       add_test(NAME ${_t} COMMAND ${_t})
       set_tests_properties(${_t} PROPERTIES TIMEOUT 60)
     endif()
@@ -444,10 +469,15 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # (CUDA, or HIP through include/strata/hip_compat as the GLM engine; Linux and Windows)
   if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(maya-ds4 src/ds4/ds4_main.cpp src/ds4/ds4_model.cu src/ds4/ds4_kernels.cu src/ds4/ds4_vision.cu
-                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp)
+                              src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu src/ds4/ds4_iq_cpu.cpp
+                              src/ds4/ds4_lt.cu src/ds4/ds4_host_ar.cpp)
     target_include_directories(maya-ds4 PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(maya-ds4 PRIVATE strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target}
                           ${_strata_gpu_blas_target})
+    if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)   # (the prompt path's dense GEMMs: ds4_lt.cu)
+      set_source_files_properties(src/ds4/ds4_lt.cu PROPERTIES COMPILE_DEFINITIONS STRATA_HIPBLASLT_AVAILABLE=1)
+      target_link_libraries(maya-ds4 PRIVATE roc::hipblaslt)
+    endif()
     if(NOT WIN32)   # mmap / mbind (NUMA)
       add_executable(ds4_cpu_bench tests/ds4_cpu_bench.cpp)
       target_link_libraries(ds4_cpu_bench PRIVATE strata_kernels_cpu)
@@ -462,7 +492,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     # the GGUF kernels (BF16 matrices, MXFP4 experts) against a double-precision reference, and the packed KV caches
     # against the BF16 rows bit for bit (needs a GPU, no model)
     add_executable(ds4_gguf_test tests/ds4_gguf_test.cu src/ds4/ds4_gguf.cu src/ds4/ds4_gguf_cpu.cpp src/ds4/ds4_iq.cu
-                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu)
+                                 src/ds4/ds4_iq_cpu.cpp src/ds4/ds4_kernels.cu
+                                 src/ds4/ds4_host_ar.cpp)
     target_include_directories(ds4_gguf_test PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
     target_link_libraries(ds4_gguf_test PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
   endif()
@@ -481,6 +512,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(glm_mv_bench PRIVATE strata_kernels strata_hip_runtime)
     add_test(NAME glm_mv_parity COMMAND glm_mv_bench --parity-only)
     set_tests_properties(glm_mv_parity PROPERTIES TIMEOUT 120)
+    # the decode attention's indexer scores and MLA split attention: the take-two kernels against the originals, bit for bit
+    add_executable(glm_attn_bench tests/hip/glm_attn_bench.cu)
+    target_link_libraries(glm_attn_bench PRIVATE strata_kernels strata_hip_runtime)
+    add_test(NAME glm_attn_parity COMMAND glm_attn_bench --parity-only)
+    set_tests_properties(glm_attn_parity PROPERTIES TIMEOUT 120)
+    add_executable(ds4_attention_layout_bench EXCLUDE_FROM_ALL tests/ds4_attention_layout_bench.cu src/ds4/ds4_kernels.cu)
+    target_include_directories(ds4_attention_layout_bench PRIVATE ${_strata_gpu_include_directories} third_party/ggml)
+    target_link_libraries(ds4_attention_layout_bench PRIVATE strata_kernels_cpu ${_strata_gpu_runtime_target})
     add_executable(hip_expert_cache_staging tests/hip/expert_cache_staging.cpp)
     target_link_libraries(hip_expert_cache_staging PRIVATE strata_engine)
     add_test(NAME hip_expert_cache_staging COMMAND hip_expert_cache_staging)
@@ -637,6 +676,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # the unified-memory pool/RAM-tier sizing policy (host only)
   add_executable(glm_memory_test tests/glm_memory_test.cpp)
   add_test(NAME glm_memory_test COMMAND glm_memory_test)
+  # the devices of a layer split beside the expert helper (host only)
+  add_executable(glm_split_devices_test tests/glm_split_devices_test.cpp)
+  target_include_directories(glm_split_devices_test PRIVATE include)
+  add_test(NAME glm_split_devices_test COMMAND glm_split_devices_test)
   add_executable(glm_pack_test src/core/glm_pack_test.cpp)
   target_include_directories(glm_pack_test PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(glm_pack_test PRIVATE ${_strata_gpu_glm_libs} ${_strata_gpu_runtime_target})

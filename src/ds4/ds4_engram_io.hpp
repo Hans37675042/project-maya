@@ -13,8 +13,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <cstdio>
+#include <limits>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -126,9 +130,55 @@ struct EgBatch {
 /// The reader's threads: each read on whichever is free, in submission order, with that thread's own file handles.
 class EgReader {
 public:
-    ~EgReader() { stop(); }
-    void start(const std::vector<std::string>& paths, int threads) {
+    ~EgReader() {
+        stop();
+#if !defined(_WIN32)
+        for (auto& r : ram_) { ::munlock(r.base, r.mapped); os::unmap(r.base, r.mapped); }
+#endif
+    }
+    // A successful preload is fully resident and locked. In RAM mode a missing range is an error.
+    bool pin_range(const std::string& path, int file, uint64_t off, uint64_t n, std::string& err) {
+#if defined(_WIN32)
+        err = "Engram RAM mode requires Linux"; return false;
+#else
+        const long page_size = ::sysconf(_SC_PAGESIZE);
+        if (file < 0 || n == 0 || page_size <= 0) { err = "Engram RAM: invalid file or range"; return false; }
+        const uint64_t page = (uint64_t) page_size, begin = off - off % page;
+        if (n > std::numeric_limits<size_t>::max() - (off - begin) ||
+            begin > (uint64_t) std::numeric_limits<off_t>::max()) {
+            err = "Engram RAM: range is too large"; return false;
+        }
+        const size_t length = (size_t) (off - begin + n);
+        const os::fd_t fd = os::open_ro(path);
+        if (fd == os::kBadFd) { err = "Engram RAM: cannot open " + path; return false; }
+        const uint64_t bytes = os::file_size(fd);
+        if (off > bytes || n > bytes - off) {
+            os::close_fd(fd); err = "Engram RAM: range exceeds the file"; return false;
+        }
+        void* raw = ::mmap(nullptr, length, PROT_READ, MAP_SHARED, (int) fd, (off_t) begin);
+        os::close_fd(fd);
+        if (raw == MAP_FAILED) { err = "Engram RAM: mmap failed"; return false; }
+        uint8_t* base = (uint8_t*) raw;
+        const size_t chunk = 256ull << 20;
+        for (size_t pos = 0; pos < length; pos += chunk) {
+            if (::mlock(base + pos, std::min(chunk, length - pos)) != 0) {
+                err = "Engram RAM: mlock failed: " + std::string(std::strerror(errno)) +
+                      "; check available RAM and RLIMIT_MEMLOCK (ulimit -l)";
+                ::munlock(base, length); ::munmap(base, length); return false;
+            }
+            if ((pos / chunk) % 32 == 0 || pos + chunk >= length)
+                std::fprintf(stderr, "ds4: Engram RAM file %d locked %.2f / %.2f GB\n", file,
+                             (double) std::min(pos + chunk, length) / 1e9, (double) length / 1e9);
+        }
+        ram_.push_back({file, off, n, base, length, (size_t) (off - begin)});
+        return true;
+#endif
+    }
+    void require_ram() { ram_only_ = true; }
+    /// direct[i]: file i read unbuffered (Windows, a file nothing maps: os::open_unbuffered), else buffered
+    void start(const std::vector<std::string>& paths, int threads, std::vector<char> direct = {}) {
         paths_ = paths;
+        direct_ = std::move(direct);
         for (int i = 0; i < threads; ++i) th_.emplace_back([this] { loop(); });
     }
     void stop() {
@@ -139,6 +189,9 @@ public:
         cv_.notify_all();
         for (auto& t : th_) t.join();
         th_.clear();
+        if (check_n_.load() > 0)
+            std::fprintf(stderr, "ds4 Engram check (DS4_EG_CHECK): %lld rows read unbuffered, %lld differed from a buffered read\n",
+                         (long long) check_n_.load(), (long long) check_bad_.load());
     }
     int threads() const { return (int) th_.size(); }
     void submit(EgBatch& b) {
@@ -169,9 +222,20 @@ public:
     }
 
 private:
+    struct RamRange { int file; uint64_t off, n; uint8_t* base; size_t mapped, delta; };
+    std::vector<RamRange> ram_;
+    bool ram_only_ = false;
+    bool copy_ram(int file, uint64_t off, uint64_t n, void* dst) const {
+        for (const auto& r : ram_) if (r.file == file && off >= r.off && n <= r.n && off - r.off <= r.n - n) {
+            std::memcpy(dst, r.base + r.delta + (size_t) (off - r.off), (size_t) n); return true;
+        }
+        return false;
+    }
     void loop() {
         std::vector<os::fd_t> fds(paths_.size(), os::kBadFd);   // this thread's own handles, opened on first use
-        std::vector<uint8_t> buf;
+        std::vector<os::fd_t> ufds(paths_.size(), os::kBadFd);  // (and its unbuffered ones)
+        std::vector<uint8_t> buf, abuf(3 * os::kDirectAlign);
+        uint8_t* al = abuf.data() + (os::kDirectAlign - (uintptr_t) abuf.data() % os::kDirectAlign) % os::kDirectAlign;
         for (;;) {
             Job job;
             {
@@ -182,7 +246,7 @@ private:
                 q_.pop_front();
             }
             EgBatch& b = *job.b;
-            for (int i = job.i0; i < job.i1; ++i) b.ok[(size_t) i] = read(fds, b.reads[(size_t) i], buf) ? 1 : 0;
+            for (int i = job.i0; i < job.i1; ++i) b.ok[(size_t) i] = read(fds, ufds, al, b.reads[(size_t) i], buf) ? 1 : 0;
             const int64_t t = now_ns();
             for (int64_t prev = b.t1.load(); t > prev && !b.t1.compare_exchange_weak(prev, t);) {
             }
@@ -192,8 +256,45 @@ private:
             }
         }
         for (os::fd_t f : fds) os::close_fd(f);
+        for (os::fd_t f : ufds) os::close_fd(f);
     }
-    bool read(std::vector<os::fd_t>& fds, const EgRead& r, std::vector<uint8_t>& buf) {
+    bool read(std::vector<os::fd_t>& fds, std::vector<os::fd_t>& ufds, uint8_t* al, const EgRead& r,
+              std::vector<uint8_t>& buf) {
+        if (ram_only_) {
+            if (!r.mx8) {
+                return copy_ram(r.file, r.off, r.n, r.dst) &&
+                       (r.n2 == 0 || copy_ram(r.file2, r.off2, r.n2, r.scales));
+            }
+            buf.resize(r.n);
+            if (!copy_ram(r.file, r.off, r.n, buf.data())) return false;
+            for (uint32_t k = 0; k < r.n / 33; ++k) {
+                r.scales[k] = buf[(size_t) k * 33];
+                std::memcpy(r.dst + (size_t) k * 32, buf.data() + (size_t) k * 33 + 1, 32);
+            }
+            return true;
+        }
+        if (r.mx8 && r.file >= 0 && (size_t) r.file < direct_.size() && direct_[(size_t) r.file] &&
+            os::direct_span(r.off, r.n) <= 2 * os::kDirectAlign) {
+            os::fd_t& u = ufds[(size_t) r.file];
+            if (u == os::kBadFd) u = os::open_unbuffered(paths_[(size_t) r.file]);
+            if (u != os::kBadFd && os::pread_unbuffered(u, al, r.n, r.off)) {
+                const uint8_t* src = al + r.off % os::kDirectAlign;
+                static const bool check = std::getenv("DS4_EG_CHECK") != nullptr;   // (each row read buffered too)
+                if (check) {
+                    std::vector<uint8_t> ref(r.n);
+                    os::fd_t& f2 = fds[(size_t) r.file];
+                    if (f2 == os::kBadFd) f2 = os::open_ro(paths_[(size_t) r.file]);
+                    const bool ok = f2 != os::kBadFd && os::pread_full(f2, ref.data(), r.n, r.off);
+                    if (!ok || std::memcmp(ref.data(), src, r.n) != 0) ++check_bad_;
+                    ++check_n_;
+                }
+                for (uint32_t k = 0; k < r.n / 33; ++k) {   // [scale, 32 codes] -> codes | scales
+                    r.scales[k] = src[(size_t) k * 33];
+                    std::memcpy(r.dst + (size_t) k * 32, src + (size_t) k * 33 + 1, 32);
+                }
+                return true;
+            }   // (else buffered, below)
+        }
         auto fd = [&](int file) {
             if (file < 0 || file >= (int) fds.size()) return os::kBadFd;
             if (fds[(size_t) file] == os::kBadFd) fds[(size_t) file] = os::open_ro(paths_[(size_t) file]);
@@ -217,6 +318,10 @@ private:
     }
 
     std::vector<std::string> paths_;
+    std::vector<char> direct_;
+
+public:
+    std::atomic<int64_t> check_n_{0}, check_bad_{0};   // (DS4_EG_CHECK: rows compared, rows that differed)
     std::vector<std::thread> th_;
     std::mutex mu_;
     std::condition_variable cv_;
