@@ -598,6 +598,9 @@ class StrataEngine:
             found = ram_oom_of(tail)
             why = (f" - {restarts} restart(s) with a smaller RAM tier, the last at STRATA_GLM_RAM_GB={ram_try:g}" +
                    (f" ran out of pinned RAM at {found[0]:.2f} GB" if found else ""))
+        # (this engine is not usable: its pipes may be closed by _end_refused with the process still running, which
+        #  alive() must not take for a live engine - a request would write to the closed stdin)
+        self.ended = True
         if log:
             self.log.close()   # (no engine writes to it any more)
         raise RuntimeError("the engine exited before it was ready" + (f" (see {log})" if log else "") + why)

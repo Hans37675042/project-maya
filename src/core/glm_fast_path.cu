@@ -470,8 +470,12 @@ static void pin_free(void* p, size_t bytes) {
     g_pin_held -= (int64_t) bytes;
 }
 constexpr size_t kPinRoom = (size_t) 512 << 20;   // what a tier leaves pinnable above it (the driver's own buffers)
+// glmfast::pin_room_in_pieces reads the room kept (kPinRoom, or a multiple of it for a split's GPUs) in pin_room's
+// kPinProbeStep probes, and takes kPinRoom itself (one GPU's) for the one block it always was
+static_assert((int64_t) kPinRoom == glmfast::kPinRoomOneGpu, "glm_memory.hpp's one-GPU room is kPinRoom");
+static_assert((int64_t) kPinRoom % glmfast::kPinProbeStep == 0, "kPinRoom (and its multiples) are whole probe steps");
 
-// How much more pins now, up to `limit` bytes: probes of 1 GB, then of 256 MB, until one is refused (freed again).
+// How much more pins now, up to `limit` bytes: probes of 1 GB, then of kPinProbeStep (256 MB), until one is refused (freed again).
 // Measured at a pinning cap's first refusal, it sizes the tier's classes from there on: the steps down (3%, then 12%)
 // landed up to a step under the cap, and the slots left under it held experts the disk then served (a Windows PC with
 // 128 GB: the tier 2.5 GB under its cap, 6-13 disk reads a token instead of 0.5-1, decode 11-18 tok/s instead of
@@ -479,7 +483,7 @@ constexpr size_t kPinRoom = (size_t) 512 << 20;   // what a tier leaves pinnable
 static int64_t pin_room(int64_t limit) {
     std::vector<std::pair<void*, size_t>> probes;
     int64_t got = 0;
-    for (const size_t probe : {(size_t) 1 << 30, (size_t) 256 << 20})
+    for (const size_t probe : {(size_t) 1 << 30, (size_t) glmfast::kPinProbeStep})
         for (void* q = nullptr; got + (int64_t) probe <= limit; q = nullptr) {
             if (pin_alloc(&q, probe, cudaHostAllocDefault) != cudaSuccess) {
                 cudaGetLastError();
@@ -1795,37 +1799,26 @@ bool Glm5Model::fast_setup(std::string& err) {
         // Linux): a block of many GB takes far more of Windows' per-process pinning budget than its size - 61 GB pin in
         // 1 GB pieces where the largest single block is ~21 GB - so a 2-GPU split's first part left its second 0 GB and
         // the start failed (#417)
-        static const int64_t piece_mb = getenv("STRATA_GLM_PIN_PIECE_MB") ? std::atoll(getenv("STRATA_GLM_PIN_PIECE_MB"))
-#ifdef _WIN32
-                                                                          : 1024;
-#else
-                                                                          : 0;
-#endif
+        static const int64_t piece_mb = glmfast::pin_piece_mb(getenv("STRATA_GLM_PIN_PIECE_MB"));
         // each class's pin as it stands: its pieces (one, the whole block, when cls_per is 0) and the slots a piece
         // holds - every piece pinned is freed with the size it was pinned at (g_pin_held stays exact)
         std::vector<int> cls_per(n_cls, 0);
         std::vector<std::vector<uint8_t*>> cls_parts(n_cls);
         const auto free_parts = [&](size_t c, int64_t n) {
-            const int64_t per = cls_per[c] > 0 ? cls_per[c] : n;
-            for (size_t i = 0; i < cls_parts[c].size(); ++i)
-                pin_free(cls_parts[c][i], (size_t) std::min<int64_t>(per, n - (int64_t) i * per) * cls_stride[c]);
-            cls_parts[c].clear();
+            glmfast::free_pieces(cls_parts[c], n, cls_per[c], (int64_t) cls_stride[c],
+                                 [](uint8_t* q, int64_t b) { pin_free(q, (size_t) b); });
         };
-        // class c's n slots, piece by piece: a piece refused frees the ones before it
+        // class c's n slots, piece by piece: a piece refused frees the ones before it (glmfast::pin_pieces)
         const auto pin_blocks = [&](size_t c, int64_t n) {
-            cls_parts[c].clear();
-            const int64_t per = cls_per[c] > 0 ? cls_per[c] : n;
-            for (int64_t s = 0; s < n; s += per) {
-                void* q = nullptr;
-                if (pin_alloc(&q, (size_t) std::min<int64_t>(per, n - s) * cls_stride[c], cudaHostAllocPortable) !=
-                    cudaSuccess) {
+            return glmfast::pin_pieces(
+                cls_parts[c], n, cls_per[c], (int64_t) cls_stride[c],
+                [](int64_t b) -> uint8_t* {
+                    void* q = nullptr;
+                    if (pin_alloc(&q, (size_t) b, cudaHostAllocPortable) == cudaSuccess) return (uint8_t*) q;
                     cudaGetLastError();
-                    free_parts(c, n);
-                    return false;
-                }
-                cls_parts[c].push_back((uint8_t*) q);
-            }
-            return !cls_parts[c].empty();
+                    return nullptr;
+                },
+                [](uint8_t* q, int64_t b) { pin_free(q, (size_t) b); });
         };
         const auto pin = [&](size_t c, int64_t n) {
             const size_t bytes = (size_t) n * cls_stride[c];
@@ -1837,14 +1830,22 @@ bool Glm5Model::fast_setup(std::string& err) {
                 cls_parts[c].clear();
                 return true;
             }
-            cls_per[c] = piece_mb > 0 ? (int) std::max<int64_t>(1, (piece_mb << 20) / (int64_t) cls_stride[c]) : 0;
+            cls_per[c] = glmfast::pin_piece_slots(piece_mb, (int64_t) cls_stride[c]);
             if (pin_blocks(c, n)) {
                 // ... and leave room under the cap: a pageable copy needs pinned buffers of the driver's own, and with
                 // two tiers pinned right up to it the warmed tables' upload failed (#105).  The room that will not
-                // pin: a step less
-                void* above = nullptr;
-                if (pin_alloc(&above, (size_t) keep, cudaHostAllocDefault) == cudaSuccess) {
+                // pin: a step less.  (Probed in pieces - pin_room's 1 GB and 256 MB - only where the tier pins in
+                // pieces and keep is a split's several-GPU room under a cap (1.5 GB on two GPUs: one block would take
+                // more of Windows' budget than the pieces the driver's buffers need, #417); one GPU's kPinRoom, and a
+                // tier in one block, probe the one block they always did - glmfast::pin_room_in_pieces)
+                const auto room_above = [&] {
+                    if (glmfast::pin_room_in_pieces(piece_mb, keep)) return pin_room(keep) >= keep;
+                    void* above = nullptr;
+                    if (pin_alloc(&above, (size_t) keep, cudaHostAllocDefault) != cudaSuccess) return false;
                     pin_free(above, (size_t) keep);
+                    return true;
+                };
+                if (room_above()) {
                     cls_p[c] = cls_parts[c][0];
                     cls_reg[c] = 0;
                     return true;
@@ -2414,7 +2415,7 @@ bool Glm5Model::fast_helper_check(std::string& err) {
             const int rs = F->ram_of[(size_t) keys[i]];
             if (rs >= 0) {
                 const auto& R = F->rc[(size_t) F->layer_rc[(size_t) il]];
-                if (std::memcmp(R.base + (size_t) rs * R.stride, F->stage[0], Ly.blob) != 0)
+                if (std::memcmp(R.slot((size_t) rs), F->stage[0], Ly.blob) != 0)
                     return fail("GLM helper check: CUDA" + std::to_string(dev_) + "'s RAM tier holds other bytes than the "
                                 "pack for layer " + std::to_string(il) + " expert " + std::to_string(e));
             }
@@ -4265,10 +4266,18 @@ void Glm5Model::fast_destroy() {
                      (unsigned long long) F->kda_graphs.replays,
                      (unsigned long long) F->kda_graphs.invalidations);
     F->kda_graphs.clear();   // before the graph's buffers and streams are freed
-    for (auto& R : F->rc)
-        if (R.base && R.registered) numa_pinned_free(R.base, (size_t) R.n * R.stride);
-        else
-            for (size_t i = 0; i < R.n_parts(); ++i) cudaFreeHost(R.part(i));
+    for (auto& R : F->rc) {
+        if (R.base && R.registered) {
+            numa_pinned_free(R.base, (size_t) R.n * R.stride);
+            continue;
+        }
+        // the pieces (the one block when per_part is 0) freed through pin_free, each at the bytes it was pinned at: the
+        // pinning counter (g_pin_held) goes back to what it was before the tier - a raw cudaFreeHost left it charged
+        std::vector<uint8_t*> pieces;
+        for (size_t i = 0; i < R.n_parts(); ++i) pieces.push_back(R.part(i));
+        glmfast::free_pieces(pieces, R.n, R.per_part, (int64_t) R.stride,
+                             [](uint8_t* q, int64_t b) { pin_free(q, (size_t) b); });
+    }
     for (auto& d : F->draining) cudaEventDestroy(d.ev);
     for (auto& m : F->bg) cudaEventDestroy(m.ev);
     for (auto e : F->ev_free) cudaEventDestroy(e);

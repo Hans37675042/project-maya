@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -299,6 +300,71 @@ inline std::pair<int64_t, int64_t> split_later(const std::vector<int64_t>& plan,
 // a class's planned slots at the split's scale, never under its floor
 inline int64_t scaled_slots(int64_t n, int64_t least, double scale) {
     return scale < 1.0 ? std::max(least, (int64_t) ((double) n * scale)) : n;
+}
+
+// The RAM tier pinned in pieces (#417, STRATA_GLM_PIN_PIECE_MB): a block of many GB takes far more of Windows'
+// per-process pinning budget than its size, so a class is pinned in pieces of at most piece_mb MB.
+// The piece size when STRATA_GLM_PIN_PIECE_MB is unset: Windows 1024 MB, elsewhere 0 (one block)
+constexpr int64_t kPinPieceMbWindows = 1024;
+inline int64_t pin_piece_mb_default() {
+#ifdef _WIN32
+    return kPinPieceMbWindows;
+#else
+    return 0;
+#endif
+}
+// the piece size in MB from STRATA_GLM_PIN_PIECE_MB's value (nullptr: unset - the platform's default)
+inline int64_t pin_piece_mb(const char* env_value) {
+    return env_value != nullptr ? std::atoll(env_value) : pin_piece_mb_default();
+}
+// The slots a piece holds: at least 1 (a slot larger than a piece is a piece of its own); 0 when piece_mb <= 0 - one block
+inline int pin_piece_slots(int64_t piece_mb, int64_t stride) {
+    if (piece_mb <= 0 || stride <= 0) return 0;
+    const int64_t mb = std::min<int64_t>(piece_mb, INT64_MAX >> 20);
+    return (int) std::min<int64_t>(INT_MAX, std::max<int64_t>(1, (mb << 20) / stride));
+}
+// Whether the room kept above the RAM tier (`keep` bytes) is probed in pieces (pin_room's 1 GiB and 256 MiB probes)
+// rather than as one block: only when the tier itself pins in pieces (piece_mb > 0) and `keep` is more than the room
+// one GPU keeps - a split under a pinning cap keeps several GPUs' (1.5 GiB for two), a block that would take more of
+// Windows' budget than the pieces the driver's buffers need (#417).  One GPU's room stays the one block it was: probed
+// in pieces, its 512 MiB would read as two 256 MiB probes, more lenient than one block.  pin_room reads `keep` in
+// kPinProbeStep steps, so a keep that is not a multiple of the step stays one block too (never read short).
+inline bool pin_room_in_pieces(int64_t piece_mb, int64_t keep) {
+    return piece_mb > 0 && keep > kPinRoomOneGpu && keep % kPinProbeStep == 0;
+}
+// the pieces of a class of n slots, per_part slots each (per_part <= 0: one block; n <= 0: none)
+inline size_t pin_piece_count(int64_t n, int per_part) {
+    if (n <= 0) return 0;
+    return per_part > 0 ? (size_t) ((n + per_part - 1) / per_part) : 1;
+}
+// the slots of piece i: per_part, but the last one holds what is left (per_part <= 0: the whole class)
+inline int64_t pin_piece_len(int64_t n, int per_part, size_t i) {
+    if (per_part <= 0) return n;
+    return std::max<int64_t>(0, std::min<int64_t>(per_part, n - (int64_t) i * per_part));
+}
+// A class's pieces freed (release(piece, bytes)), each at the bytes it was pinned at - `n` and `per_part` as they were
+// pinned (pin_pieces): a pinning counter (g_pin_held) given back exactly what it was charged
+template <class Release>
+inline void free_pieces(std::vector<uint8_t*>& parts, int64_t n, int per_part, int64_t stride, Release release) {
+    for (size_t i = 0; i < parts.size(); ++i) release(parts[i], pin_piece_len(n, per_part, i) * stride);
+    parts.clear();
+}
+// A class of n slots of `stride` bytes pinned piece by piece into `parts` (alloc(bytes) -> the piece, nullptr:
+// refused).  A refused piece frees the ones before it and leaves `parts` empty: false.
+template <class Alloc, class Release>
+inline bool pin_pieces(std::vector<uint8_t*>& parts, int64_t n, int per_part, int64_t stride, Alloc alloc,
+                       Release release) {
+    parts.clear();
+    const size_t count = pin_piece_count(n, per_part);
+    for (size_t i = 0; i < count; ++i) {
+        uint8_t* p = alloc(pin_piece_len(n, per_part, i) * stride);
+        if (p == nullptr) {
+            free_pieces(parts, n, per_part, stride, release);
+            return false;
+        }
+        parts.push_back(p);
+    }
+    return !parts.empty();
 }
 
 // A warm-up that runs out of memory (a copy or the tables' upload answers "out of memory" when the RAM tier is pinned

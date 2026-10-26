@@ -600,7 +600,7 @@ struct Glm5Model::FastState {
             return per_part > 0 ? parts[s / (size_t) per_part] + (s % (size_t) per_part) * stride : base + s * stride;
         }
         size_t part_slots(size_t i) const {   // the slots of piece i
-            return per_part > 0 ? std::min((size_t) per_part, (size_t) n - i * (size_t) per_part) : (size_t) n;
+            return (size_t) glmfast::pin_piece_len(n, per_part, i);   // (the pieces fast_setup pinned)
         }
         size_t n_parts() const { return per_part > 0 ? parts.size() : (base != nullptr ? 1 : 0); }
         uint8_t* part(size_t i) const { return per_part > 0 ? parts[i] : base; }
